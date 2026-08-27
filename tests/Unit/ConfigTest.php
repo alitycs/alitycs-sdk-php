@@ -64,6 +64,8 @@ final class ConfigTest extends TestCase
         yield 'flushInterval NaN' => ['apiKey' => 'k', 'options' => ['flushInterval' => NAN]];
         yield 'flushInterval a string' => ['apiKey' => 'k', 'options' => ['flushInterval' => 'soon']];
         yield 'maxQueueSize zero' => ['apiKey' => 'k', 'options' => ['maxQueueSize' => 0]];
+        yield 'maxQueueSize below flushSize' => ['apiKey' => 'k', 'options' => ['flushSize' => 10, 'maxQueueSize' => 5]];
+        yield 'maxQueueSize one below default flushSize' => ['apiKey' => 'k', 'options' => ['maxQueueSize' => 24]];
         yield 'maxRetries negative' => ['apiKey' => 'k', 'options' => ['maxRetries' => -1]];
         yield 'timeoutMs zero' => ['apiKey' => 'k', 'options' => ['timeoutMs' => 0]];
         yield 'sessionTimeout zero' => ['apiKey' => 'k', 'options' => ['sessionTimeout' => 0]];
@@ -77,5 +79,25 @@ final class ConfigTest extends TestCase
         $this->expectException(\InvalidArgumentException::class);
 
         new Config($apiKey, $options);
+    }
+
+    public function testQueueCapBelowFlushSizeNamesTheCombinationInTheError(): void
+    {
+        try {
+            new Config('k', ['flushSize' => 10, 'maxQueueSize' => 5]);
+            self::fail('Expected InvalidArgumentException');
+        } catch (\InvalidArgumentException $error) {
+            $this->assertStringContainsString('maxQueueSize', $error->getMessage());
+            $this->assertStringContainsString('flushSize', $error->getMessage());
+        }
+    }
+
+    public function testQueueCapExactlyAtFlushSizeIsAllowed(): void
+    {
+        // The last accepted event is the one that triggers the send, so equality works.
+        $config = new Config('k', ['flushSize' => 5, 'maxQueueSize' => 5]);
+
+        $this->assertSame(5, $config->maxQueueSize);
+        $this->assertSame(5, $config->flushSize);
     }
 }

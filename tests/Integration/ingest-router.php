@@ -7,6 +7,10 @@ declare(strict_types=1);
  * request it receives as one JSON line in REQUESTS_FILE and answers with the status
  * named in STATUS_PLAN ("500,202" fails the first request then accepts the rest; the
  * final status repeats for any further requests; empty means always 202).
+ *
+ * RETRY_AFTER_PLAN ("2,,date") optionally sends a matching-position `Retry-After`
+ * header: a number is sent verbatim as delta-seconds; the token "date" sends an
+ * HTTP-date three seconds in the future; empty sends nothing.
  */
 
 // getenv(), not $_SERVER: the built-in server rebuilds $_SERVER per request and drops
@@ -15,6 +19,11 @@ $planParameter = trim((string) getenv('STATUS_PLAN'));
 $statusPlan = $planParameter === ''
     ? [202]
     : array_map(intval(...), explode(',', $planParameter));
+
+$retryAfterParameter = trim((string) getenv('RETRY_AFTER_PLAN'));
+$retryAfterPlan = $retryAfterParameter === ''
+    ? []
+    : explode(',', $retryAfterParameter);
 
 $requestsFile = (string) getenv('REQUESTS_FILE');
 
@@ -41,4 +50,10 @@ file_put_contents($requestsFile, json_encode($record) . "\n", FILE_APPEND | LOCK
 
 http_response_code($status);
 header('Content-Type: application/json');
+$retryAfter = $retryAfterPlan[min(count($retryAfterPlan) - 1, $sequence - 1)] ?? '';
+if ($retryAfter !== '') {
+    header('Retry-After: ' . ($retryAfter === 'date'
+        ? gmdate('D, d M Y H:i:s \G\M\T', time() + 3)
+        : $retryAfter));
+}
 echo json_encode($status < 300 ? ['accepted' => true] : ['error' => 'injected_status_' . $status]);

@@ -76,6 +76,52 @@ final class HttpTransportTest extends TestCase
         $this->assertSame([1000], $this->sleeps);
     }
 
+    public function testRateLimited429HonoursTheRetryAfterSecondsHeader(): void
+    {
+        $transport = $this->transport(maxRetries: 1, statusPlan: '429,202', retryAfterPlan: '2');
+
+        $this->assertTrue($transport->send($this->payload()));
+
+        $this->assertSame([429, 202], array_map(static fn (array $r) => $r['status'], $this->server->requests()));
+        // Retry-After: 2 replaces the 1s default backoff for the attempt after the 429.
+        $this->assertSame([2000], $this->sleeps);
+    }
+
+    public function testRateLimited429HonoursTheRetryAfterHttpDateHeader(): void
+    {
+        $transport = $this->transport(maxRetries: 1, statusPlan: '429,202', retryAfterPlan: 'date');
+
+        $this->assertTrue($transport->send($this->payload()));
+
+        // The router sends an HTTP-date three seconds out; a couple of hundred ms of
+        // wall time may pass between producing and parsing the header.
+        $this->assertCount(1, $this->sleeps);
+        $this->assertGreaterThanOrEqual(2000, $this->sleeps[0]);
+        $this->assertLessThanOrEqual(3000, $this->sleeps[0]);
+    }
+
+    public function testInvalidRetryAfterFallsBackToExponentialBackoff(): void
+    {
+        $transport = $this->transport(
+            maxRetries: 1,
+            statusPlan: '429,202',
+            retryAfterPlan: 'not-a-date'
+        );
+
+        $this->assertTrue($transport->send($this->payload()));
+
+        $this->assertSame([1000], $this->sleeps);
+    }
+
+    public function testHugeRetryAfterIsStillCappedAtTenSeconds(): void
+    {
+        $transport = $this->transport(maxRetries: 1, statusPlan: '429,202', retryAfterPlan: '3600');
+
+        $this->assertTrue($transport->send($this->payload()));
+
+        $this->assertSame([10_000], $this->sleeps);
+    }
+
     public function testClientErrorsAreNotRetried(): void
     {
         $transport = $this->transport(maxRetries: 3, debug: true, statusPlan: '400');
@@ -83,6 +129,18 @@ final class HttpTransportTest extends TestCase
         $this->assertFalse($transport->send($this->payload()));
 
         $this->assertCount(1, $this->server->requests(), 'a 400 is permanent — no retry');
+        $this->assertSame([], $this->sleeps);
+    }
+
+    public function testRedirect3xxIsTerminalAndNeverRetried(): void
+    {
+        // A 302 used to fall into the retryable bucket and burn the whole retry budget
+        // on an answer that could never change.
+        $transport = $this->transport(maxRetries: 5, debug: true, statusPlan: '302');
+
+        $this->assertFalse($transport->send($this->payload()));
+
+        $this->assertCount(1, $this->server->requests(), 'a 3xx is permanent — no retry');
         $this->assertSame([], $this->sleeps);
     }
 
@@ -107,22 +165,31 @@ final class HttpTransportTest extends TestCase
         $this->assertSame([1000, 2000], $this->sleeps);
     }
 
-    public function testPayloadThatCannotEncodeIsDroppedWithoutARequest(): void
+    public function testIllFormedUtf8InPayloadIsSubstitutedAndStillDelivered(): void
     {
+        // Ill-formed UTF-8 used to fail json_encode and silently drop the whole batch;
+        // it is now substituted (U+FFFD) so the batch still delivers.
         $transport = $this->transport();
-        // Invalid UTF-8 makes json_encode fail before anything reaches the network.
         $payload = $this->payload(eventName: "\xB1\x31");
 
-        $this->assertFalse($transport->send($payload));
-        $this->assertSame([], $this->server->requests());
+        $this->assertTrue($transport->send($payload));
+        $requests = $this->server->requests();
+        self::assertCount(1, $requests);
+        $this->assertSame(202, $requests[0]['status']);
+        $event = $requests[0]['body']['events'][0];
+        $this->assertSame(1, preg_match('//u', $event['event']), 'delivered event must be valid UTF-8');
     }
 
     // ---------------------------------------------------------------------- helpers
 
-    private function transport(int $maxRetries = 3, bool $debug = false, string $statusPlan = ''): HttpTransport
-    {
+    private function transport(
+        int $maxRetries = 3,
+        bool $debug = false,
+        string $statusPlan = '',
+        string $retryAfterPlan = ''
+    ): HttpTransport {
         if ($this->server === null) {
-            $this->server = LocalIngestServer::start($statusPlan);
+            $this->server = LocalIngestServer::start($statusPlan, $retryAfterPlan);
         }
 
         return new HttpTransport(

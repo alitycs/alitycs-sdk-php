@@ -69,6 +69,25 @@ final class SessionManager
         return $this->session;
     }
 
+    /**
+     * Post-fork repair, run in the child process only: rotates just the session id so a
+     * forked child stops appending activity to its parent's session, while keeping both
+     * the anonymous identity and any identified user (the child is still serving the
+     * same caller at fork time).
+     */
+    public function resetForChild(): SessionData
+    {
+        $this->session = new SessionData(
+            'sess_' . Utils::generateId(),
+            $this->session->anonymousId,
+            $this->session->userId,
+            $this->nowMs(),
+            $this->nowMs(),
+        );
+
+        return $this->session;
+    }
+
     private function isExpired(): bool
     {
         return $this->nowMs() - $this->session->lastActivity > $this->sessionTimeout;

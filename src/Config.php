@@ -86,6 +86,16 @@ final class Config
         $this->sessionTimeout = self::intOption($options, 'sessionTimeout', 30 * 60 * 1000, min: 1);
         $this->debug = self::boolOption($options, 'debug', false);
         $this->batching = self::boolOption($options, 'batching', true);
+
+        // Cross-check: the queue cap must leave room for the size trigger to fire. Below
+        // flushSize, `add()` starts dropping arrivals before the queue ever reaches the
+        // send threshold, so batching degrades into silent drop-everything.
+        if ($this->maxQueueSize < $this->flushSize) {
+            throw new \InvalidArgumentException(
+                "Config option \"maxQueueSize\" ({$this->maxQueueSize}) must be >= \"flushSize\" "
+                . "({$this->flushSize}): a queue capped below the flush threshold can never send"
+            );
+        }
     }
 
     public function apiKey(): string

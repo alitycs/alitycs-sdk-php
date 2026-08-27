@@ -56,6 +56,27 @@ event. Set it to `0` to disable the check entirely.
 In long-running processes (workers, daemons), call `flush()` on your own cadence — do
 not rely on request lifecycle hooks that never fire.
 
+## Long-running workers (Octane, Swoole, RoadRunner)
+
+A single `Client` instance kept alive across many logical requests carries state:
+`identify()`'s user id, `setGlobalProperties()`, and the session/anonymous ids. Without a
+per-request reset that state leaks into the next request's events — event A's user gets
+credited for request B's actions.
+
+Call `resetForRequest()` at the top of every logical request, before tracking anything:
+
+```php
+// e.g. Laravel Octane: in a middleware or the ListenForEventsTick listener
+$app->middleware(function ($request, $next) use ($alitycs) {
+    $alitycs->resetForRequest();   // clears user id, global properties, session identity
+    return $next($request);
+});
+```
+
+Queued but unsent events are **not** dropped by `resetForRequest()`; flush beforehand if
+they should be delivered before the identities change. For Swoole coroutine workers,
+create one client per worker process and reset per coroutine request as above.
+
 ## Configuration
 
 | Option | Default | Meaning |

@@ -69,22 +69,27 @@ final class BatchManagerTest extends TestCase
 
     // ------------------------------------------------------------------- queue cap
 
-    public function testFullQueueDropsNewArrivals(): void
+    public function testFillingTheQueueToItsCapStillTriggersDelivery(): void
     {
+        // The cap can no longer sit below flushSize (Config rejects the combination:
+        // below the threshold a send could never fire and everything would overflow).
+        // At equality the event that fills the queue is exactly the one that sends.
         $manager = $this->makeManager(new Config('k', [
-            'flushSize' => 25,
+            'flushSize' => 3,
             'flushInterval' => 0,
-            'maxQueueSize' => 2,
+            'maxQueueSize' => 3,
             'debug' => true,
         ]));
 
         $manager->add($this->event('kept-1'));
         $manager->add($this->event('kept-2'));
-        $manager->add($this->event('dropped'));
 
         $this->assertSame(2, $manager->pending());
-        $manager->flush();
-        $this->assertSame(['kept-1', 'kept-2'], $this->eventNames($this->sent[0]));
+        $this->assertSame([], $this->sent, 'below flushSize nothing is sent yet');
+
+        $manager->add($this->event('kept-3'));
+        $this->assertSame(0, $manager->pending(), 'the cap-filling add triggers the size flush');
+        $this->assertSame(['kept-1', 'kept-2', 'kept-3'], $this->eventNames($this->sent[0]));
     }
 
     // -------------------------------------------------- opportunistic interval check
@@ -154,6 +159,88 @@ final class BatchManagerTest extends TestCase
         $manager->add($this->event('lost'));
 
         $this->assertSame(0, $manager->pending(), 'the batch is dropped after delivery fails');
+        $this->assertSame(1, $manager->lostTotal());
+        $this->assertSame(0, $manager->deliveredTotal());
+    }
+
+    public function testRefusedBatchIsSplitAndBothHalvesRetried(): void
+    {
+        $manager = $this->makeManagerWithSend(new Config('k', ['flushSize' => 25, 'flushInterval' => 0]));
+
+        foreach (['a', 'b', 'c', 'd'] as $name) {
+            $manager->add($this->event($name));
+        }
+        $manager->flush();
+
+        // The whole batch of four is refused once; each half splits again because this
+        // fake refuses any payload larger than one event. Every single lands in order.
+        $sizes = array_map(static fn (BatchPayload $payload): int => count($payload->events), $this->sent);
+        $this->assertSame([4, 2, 1, 1, 2, 1, 1], $sizes);
+        $singles = [];
+        foreach ($this->sent as $payload) {
+            if (count($payload->events) === 1) {
+                $singles[] = $payload->events[0]->event;
+            }
+        }
+        $this->assertSame(['a', 'b', 'c', 'd'], $singles);
+        $this->assertSame(4, $manager->deliveredTotal());
+        $this->assertSame(0, $manager->lostTotal());
+        $this->assertSame(0, $manager->pending());
+    }
+
+    public function testRefusedSingleEventIsDroppedAndCountedLost(): void
+    {
+        $refusing = static fn (): bool => false;
+        $manager = new BatchManager(
+            new Config('k', ['flushSize' => 25, 'flushInterval' => 0]),
+            $refusing,
+            fn (): float => $this->now
+        );
+
+        $manager->add($this->event('poison'));
+        $manager->flush();
+
+        // Re-queueing a server-refused event would poison every future batch.
+        $this->assertSame(0, $manager->pending());
+        $this->assertSame(1, $manager->lostTotal());
+    }
+
+    public function testRefusedDeliveriesAreCountedLostInsteadOfAccumulating(): void
+    {
+        // With maxQueueSize >= flushSize enforced, the queue cannot silently fill up:
+        // each size-triggered send resolves its events as delivered or lost.
+        $refusing = static fn (): bool => false;
+        $manager = new BatchManager(
+            new Config('k', ['flushSize' => 2, 'flushInterval' => 0, 'maxQueueSize' => 2, 'debug' => true]),
+            $refusing,
+            fn (): float => $this->now
+        );
+
+        foreach (['a', 'b', 'c', 'd'] as $name) {
+            $manager->add($this->event($name));
+        }
+
+        $this->assertSame(0, $manager->pending(), 'nothing accumulates past a refused send');
+        $this->assertSame(4, $manager->lostTotal());
+        $this->assertSame(0, $manager->deliveredTotal());
+    }
+
+    // ------------------------------------------------------------------ fork safety
+
+    public function testResetForChildHandsInheritedEventsBackToTheParent(): void
+    {
+        $manager = $this->makeManager(new Config('k', ['flushSize' => 25, 'flushInterval' => 0]));
+
+        $manager->add($this->event('inherited'));
+        $manager->resetForChild();
+
+        $this->assertSame(0, $manager->pending(), 'the child must not deliver the parent queue');
+        $this->assertSame([], $this->sent, 'nothing may be sent from the child');
+        $this->assertSame(
+            0,
+            $manager->lostTotal(),
+            'ownership moved back to the parent — nothing was lost'
+        );
     }
 
     // ---------------------------------------------------------------------- helpers
@@ -166,6 +253,23 @@ final class BatchManagerTest extends TestCase
                 $this->sent[] = $payload;
 
                 return true;
+            },
+            fn (): float => $this->now
+        );
+    }
+
+    /**
+     * Manager whose send closure refuses any payload larger than one event, mirroring a
+     * server that rejects whole batches while singles pass.
+     */
+    private function makeManagerWithSend(Config $config, ?\Closure $send = null): BatchManager
+    {
+        return new BatchManager(
+            $config,
+            $send ?? function (BatchPayload $payload): bool {
+                $this->sent[] = $payload;
+
+                return count($payload->events) <= 1;
             },
             fn (): float => $this->now
         );

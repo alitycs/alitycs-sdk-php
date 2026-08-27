@@ -16,8 +16,14 @@ namespace Alitycs;
  *
  * **Flush triggers.** PHP has no background threads, so there is no timer-based flush.
  * Queued events are delivered when the queue reaches `flushSize`, when `flush()` is
- * called, or at script shutdown via `register_shutdown_function()` — whichever comes
- * first. `shutdown()` drains fully and never loses queued events.
+ * called, or at script shutdown by a single process-wide shutdown hook that drains every
+ * live client — whichever comes first. `shutdown()` drains fully and never loses queued
+ * events.
+ *
+ * **Fork safety.** A child created after a client exists (`pcntl_fork()`, or any other
+ * fork) never inherits the parent's queue: the first SDK call in the child detects the
+ * new process id, drops inherited-but-unsent events (the parent delivers them), and
+ * rotates the session id. Call {@see resetForChildProcess()} explicitly to do it eagerly.
  *
  * Not in scope: feature flags, session recording, group analytics, autocapture. The
  * PHP SDK is server-class — it has no `page` autocapture; call `page()` explicitly.
@@ -36,7 +42,22 @@ final class Client
     /** @var array<string, mixed> */
     private array $globalProperties = [];
 
+    private int $rejectedLocally = 0;
+
     private bool $closed = false;
+
+    /**
+     * Clients that still need delivery at script shutdown, in creation order. Weakly
+     * held: an explicitly shut-down or garbage-collected client leaves the registry by
+     * itself instead of pinning the instance (and its queue) until process exit.
+     */
+    private static ?\WeakMap $liveClients = null;
+
+    /** Whether the single process-wide shutdown handler has been registered. */
+    private static bool $shutdownHandlerRegistered = false;
+
+    /** Process id of the creator — a different current pid means we are in a forked child. */
+    private static ?int $creatorPid = null;
 
     /**
      * @param string $apiKey publishable key (secret key required for trackRevenue)
@@ -57,14 +78,94 @@ final class Client
             ? new BatchManager($this->config, $this->transport->send(...))
             : null;
 
-        // A request that ends without an explicit flush must still deliver its events.
-        register_shutdown_function(function (): void {
+        self::$liveClients ??= new \WeakMap();
+        self::$creatorPid ??= getmypid() ?: null;
+        self::$liveClients[$this] = true;
+
+        // One process-wide handler iterates the live clients; registering per instance
+        // would accumulate one closure per client for the lifetime of the process.
+        if (!self::$shutdownHandlerRegistered) {
+            self::$shutdownHandlerRegistered = true;
+            // A request that ends without an explicit flush must still deliver its events.
+            register_shutdown_function(static function (): void {
+                self::flushAllAtShutdown();
+            });
+        }
+    }
+
+    /**
+     * Post-fork repair, run in the child process only: every live client drops the queue
+     * it inherited across the fork (the parent still owns delivering those events —
+     * sending them again here would double-count each one) and rotates its session id.
+     *
+     * Called automatically the first time the child touches any SDK entry point; PHP's
+     * pcntl extension exposes no at-fork hook to register against, so long-running
+     * children may also invoke this right after `pcntl_fork()` returns 0. When pcntl is
+     * absent nothing is lost: the lazy pid check covers forks from any source. A no-op
+     * when the current process created the clients.
+     */
+    public static function resetForChildProcess(): void
+    {
+        $pid = getmypid();
+        if ($pid === false) {
+            return;
+        }
+
+        self::$creatorPid = $pid;
+        foreach (self::snapshotLiveClients() as $client) {
+            $client->resetForChild();
+        }
+    }
+
+    /** Instance half of {@see resetForChildProcess()}. */
+    private function resetForChild(): void
+    {
+        $this->batchManager?->resetForChild();
+        $this->sessionManager->resetForChild();
+    }
+
+    /**
+     * Re-anchors the SDK to the current process after a fork. Cheap (one pid compare on
+     * the hot path) and runs before any state is read or sent.
+     */
+    private function adoptCurrentProcess(): void
+    {
+        $pid = getmypid();
+        if ($pid !== false && self::$creatorPid !== null && $pid !== self::$creatorPid) {
+            self::resetForChildProcess();
+        }
+    }
+
+    /** The single registered shutdown hook: drains every client still alive. */
+    private static function flushAllAtShutdown(): void
+    {
+        foreach (self::snapshotLiveClients() as $client) {
             try {
-                $this->shutdown();
+                $client->shutdown();
             } catch (\Throwable $throwable) {
-                Log::write(true, 'Shutdown flush failed: ' . $throwable->getMessage());
+                Log::write($client->config->debug, 'Shutdown flush failed: ' . $throwable->getMessage());
             }
-        });
+        }
+    }
+
+    /**
+     * The live clients as a plain list — snapshotting keeps iteration safe while
+     * `shutdown()` deregisters clients from the same map.
+     *
+     * @return list<self>
+     */
+    private static function snapshotLiveClients(): array
+    {
+        if (!isset(self::$liveClients)) {
+            return [];
+        }
+
+        $clients = [];
+        foreach (self::$liveClients as $client => $registered) {
+            $clients[] = $client;
+        }
+
+        return $clients;
     }
 
     /** @param array<string, mixed> $properties */
@@ -130,6 +231,29 @@ final class Client
         $this->sessionManager->reset();
     }
 
+    /**
+     * Prepares a reused client instance for a new logical request.
+     *
+     * Long-running workers (Laravel Octane, Swoole, RoadRunner…) keep one `Client`
+     * alive across many logical requests. Without a per-request reset the previous
+     * request's `identify()` user, `setGlobalProperties()`, and session identity stay
+     * attached to the next request's events — cross-user misattribution. Call this at
+     * the top of every request (after resolving the current user) to clear all three:
+     *
+     * ```php
+     * // e.g. Laravel Octane middleware / worker boot
+     * $alitycs->resetForRequest();
+     * ```
+     *
+     * Queued but unsent events from the previous request are NOT dropped — flush
+     * beforehand if they should be attributed before the identities change.
+     */
+    public function resetForRequest(): void
+    {
+        $this->reset();
+        $this->globalProperties = [];
+    }
+
     /** Merged into every subsequent event's properties (call-level keys win). */
     public function setGlobalProperties(array $properties): void
     {
@@ -160,6 +284,8 @@ final class Client
     /** Sends everything currently queued as one batch. Never throws. */
     public function flush(): void
     {
+        $this->adoptCurrentProcess();
+
         if ($this->closed) {
             return;
         }
@@ -174,11 +300,17 @@ final class Client
      */
     public function shutdown(): void
     {
+        // Before draining: a forked child must not re-send the queue it inherited.
+        $this->adoptCurrentProcess();
+
         if ($this->closed) {
             return;
         }
 
         $this->closed = true;
+        if (isset(self::$liveClients)) {
+            unset(self::$liveClients[$this]);
+        }
 
         // Drain rather than flush-once so nothing can remain queued afterwards.
         while ($this->batchManager !== null && $this->batchManager->pending() > 0) {
@@ -189,12 +321,31 @@ final class Client
     /** Events accepted but not yet sent. */
     public function pending(): int
     {
+        $this->adoptCurrentProcess();
+
         return $this->batchManager?->pending() ?? 0;
+    }
+
+    /**
+     * Events rejected at build time for violating ingestion limits (also logged at warn
+     * level when they happen).
+     */
+    public function rejectedLocally(): int
+    {
+        return $this->rejectedLocally;
+    }
+
+    /** Delivery counters (`deliveredTotal()` / `lostTotal()`), null without batching. */
+    public function getBatchManager(): ?BatchManager
+    {
+        return $this->batchManager;
     }
 
     /** @param array<string, mixed>|null $properties */
     private function enqueue(EventType $type, string $name, ?array $properties, ?RevenuePayload $revenue = null): void
     {
+        $this->adoptCurrentProcess();
+
         if ($this->closed) {
             Log::write($this->config->debug, "Client already shut down — \"$name\" event dropped");
 
@@ -204,20 +355,30 @@ final class Client
         $this->sessionManager->touch();
         $session = $this->sessionManager->getSession();
 
-        $event = new AnalyticsEvent(
-            eventId: 'evt_' . Utils::generateId(),
-            event: $name,
-            eventType: $type,
-            anonymousId: $session->anonymousId,
-            sessionId: $session->id,
-            timestamp: Utils::nowMs(),
-            properties: Utils::serializeProperties(
-                array_merge($this->globalProperties, $properties ?? [])
-            ),
-            context: Context::collect(self::SDK_VERSION),
-            userId: $this->userId,
-            revenue: $revenue,
-        );
+        try {
+            $event = new AnalyticsEvent(
+                eventId: 'evt_' . Utils::generateId(),
+                event: $name,
+                eventType: $type,
+                anonymousId: $session->anonymousId,
+                sessionId: $session->id,
+                timestamp: Utils::nowMs(),
+                properties: Utils::serializeProperties(
+                    array_merge($this->globalProperties, $properties ?? [])
+                ),
+                context: Context::collect(self::SDK_VERSION),
+                userId: $this->userId,
+                revenue: $revenue,
+            );
+            Utils::validateEvent($event);
+        } catch (EventRejectedError $error) {
+            // Rejected locally: never queued, never sent — the server would refuse the
+            // entire batch. Surfaced at warn level and counted, never truncated.
+            $this->rejectedLocally++;
+            Log::warn($error->getMessage());
+
+            return;
+        }
 
         if ($this->batchManager !== null) {
             $this->batchManager->add($event);
@@ -226,8 +387,11 @@ final class Client
         }
 
         // Batching disabled: every event travels in its own single-event batch.
-        $this->transport->send(
+        $delivered = $this->transport->send(
             new BatchPayload('batch_' . Utils::generateId(), Utils::nowMs(), [$event])
         );
+        if (!$delivered) {
+            Log::warn("Event {$event->eventId} could not be delivered");
+        }
     }
 }

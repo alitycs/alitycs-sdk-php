@@ -39,8 +39,11 @@ final class LocalIngestServer
     /**
      * @param string $statusPlan comma-separated statuses per request sequence ("500,202"
      *                           fails the first request then accepts the rest); empty means always 202
+     * @param string $retryAfterPlan optional comma-separated Retry-After values per request
+     *                               sequence; a number is sent as delta-seconds, the token "date"
+     *                               sends an HTTP-date three seconds in the future, empty sends nothing
      */
-    public static function start(string $statusPlan = ''): self
+    public static function start(string $statusPlan = '', string $retryAfterPlan = ''): self
     {
         $requestsFile = (string) tempnam(sys_get_temp_dir(), 'alitycs-ingest-');
 
@@ -51,6 +54,7 @@ final class LocalIngestServer
             __DIR__,
             [
                 'STATUS_PLAN' => $statusPlan,
+                'RETRY_AFTER_PLAN' => $retryAfterPlan,
                 'REQUESTS_FILE' => $requestsFile,
             ]
         );

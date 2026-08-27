@@ -302,6 +302,73 @@ final class ClientIntegrationTest extends TestCase
         );
     }
 
+    public function testInvalidUtf8PropertyStillDelivers(): void
+    {
+        // Ill-formed UTF-8 must not fail JSON encoding and drop the batch; it is
+        // sanitized (U+FFFD substitution) so the event still arrives.
+        $this->startClient();
+
+        $this->client->track('utf8_broken', ['data' => "\xB1\x31"]);
+        $this->client->flush();
+
+        $requests = $this->server->requests();
+        self::assertCount(1, $requests);
+        $this->assertSame(202, $requests[0]['status']);
+        $event = $requests[0]['body']['events'][0];
+        $this->assertSame('utf8_broken', $event['event']);
+        $this->assertArrayHasKey('data', $event['properties']);
+        $this->assertSame(1, preg_match('//u', $event['properties']['data']));
+    }
+
+    public function testWholeBatch400SplitsAndDeliversEveryEvent(): void
+    {
+        // The server rejects an entire batch when one event violates a limit, so a
+        // refused payload is split in half and each half retried until everything lands.
+        $this->startClient(statusPlan: '400,202,202');
+
+        foreach (['a', 'b', 'c', 'd'] as $name) {
+            $this->client->track("split_$name");
+        }
+        $this->client->flush();
+
+        $requests = $this->server->requests();
+        $statuses = array_map(static fn (array $request) => $request['status'], $requests);
+        $this->assertSame([400, 202, 202], $statuses);
+
+        $delivered = [];
+        foreach ($requests as $request) {
+            if ($request['status'] >= 300) {
+                continue;
+            }
+            foreach ($request['body']['events'] as $event) {
+                $delivered[] = $event['event'];
+            }
+        }
+        sort($delivered);
+        $this->assertSame(
+            ['split_a', 'split_b', 'split_c', 'split_d'],
+            $delivered
+        );
+        $this->assertSame(4, $this->client->getBatchManager()->deliveredTotal());
+        $this->assertSame(0, $this->client->getBatchManager()->lostTotal());
+    }
+
+    public function testOversizedPropertyIsRejectedLocallyWithoutSending(): void
+    {
+        $this->startClient();
+
+        $this->client->track('too_big', ['payload' => str_repeat('x', 1001)]);
+        $this->client->track('healthy', ['n' => '1']);
+
+        $this->assertSame(1, $this->client->pending(), 'only the healthy event may be queued');
+        $this->assertSame(1, $this->client->rejectedLocally());
+        $this->client->flush();
+
+        $requests = $this->server->requests();
+        self::assertCount(1, $requests);
+        $this->assertSame(['healthy'], array_column($requests[0]['body']['events'], 'event'));
+    }
+
     // ---------------------------------------------------------------------- helpers
 
     private function startClient(array $options = [], string $statusPlan = ''): Client
