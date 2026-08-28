@@ -80,9 +80,43 @@ final class HttpTransport
             return DeliveryResult::rejected(0);
         }
 
-        $this->store->put($payload->batchId, $body, count($payload->events));
+        try {
+            $this->store->put($payload->batchId, $body, count($payload->events));
 
-        return $this->sendRecord($payload->batchId, $body);
+            return $this->sendRecord($payload->batchId, $body);
+        } catch (\Throwable $throwable) {
+            if ($this->store->contains($payload->batchId)) {
+                Log::warn(
+                    'Transport persistence failed after durable ownership was established'
+                    . ' — exact batch retained: ' . $throwable->getMessage()
+                );
+
+                return DeliveryResult::transient();
+            }
+
+            throw $throwable;
+        }
+    }
+
+    /** Persists a batch without attempting the network; used by shutdown fallback. */
+    public function persist(BatchPayload $payload): bool
+    {
+        try {
+            $body = json_encode(
+                $payload,
+                JSON_UNESCAPED_SLASHES
+                | JSON_UNESCAPED_UNICODE
+                | \JSON_INVALID_UTF8_SUBSTITUTE
+                | JSON_THROW_ON_ERROR
+            );
+            $this->store->put($payload->batchId, $body, count($payload->events));
+
+            return $this->store->contains($payload->batchId);
+        } catch (\Throwable $throwable) {
+            Log::warn('Shutdown persistence failed: ' . $throwable->getMessage());
+
+            return false;
+        }
     }
 
     /** Replays every persisted batch body without regenerating any identity fields. */

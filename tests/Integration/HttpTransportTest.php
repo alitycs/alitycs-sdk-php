@@ -201,6 +201,41 @@ final class HttpTransportTest extends TestCase
         }
     }
 
+    public function testPersistStoresWithoutNetworkThenRecoveryDelivers(): void
+    {
+        $path = sys_get_temp_dir() . '/alitycs-php-wal-' . bin2hex(random_bytes(6)) . '.json';
+        try {
+            $transport = $this->transport(maxRetries: 0, persistencePath: $path);
+            $payload = $this->payload();
+
+            $this->assertTrue($transport->persist($payload));
+            $this->assertSame(1, $transport->pendingDurableEvents());
+            $this->assertSame([], $this->server->requests(), 'persist must not touch the network');
+
+            $this->assertTrue($transport->recover());
+            $this->assertSame(0, $transport->pendingDurableEvents());
+            $this->assertSame($payload->batchId, $this->server->requests()[0]['body']['batchId']);
+        } finally {
+            @unlink($path);
+        }
+    }
+
+    public function testPersistFailureReturnsFalseWithoutNetwork(): void
+    {
+        $parentFile = (string) tempnam(sys_get_temp_dir(), 'alitycs-php-parent-file-');
+        try {
+            $transport = $this->transport(
+                maxRetries: 0,
+                persistencePath: $parentFile . '/wal.json',
+            );
+
+            $this->assertFalse($transport->persist($this->payload()));
+            $this->assertSame([], $this->server->requests());
+        } finally {
+            @unlink($parentFile);
+        }
+    }
+
     public function testRestartHonoursPersistedRetryAfterDeadline(): void
     {
         $path = sys_get_temp_dir() . '/alitycs-php-wal-' . bin2hex(random_bytes(6)) . '.json';

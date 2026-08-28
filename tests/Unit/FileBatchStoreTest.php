@@ -16,6 +16,7 @@ final class FileBatchStoreTest extends TestCase
             $store = new FileBatchStore($path);
             self::assertTrue($store->enabled());
             $store->put('batch_exact', '{"batchId":"batch_exact"}', 2);
+            self::assertTrue($store->contains('batch_exact'));
             self::assertSame(2, $store->pendingEvents());
             self::assertFileExists($path);
 
@@ -25,6 +26,7 @@ final class FileBatchStoreTest extends TestCase
             self::assertSame('{"batchId":"batch_exact"}', $restarted->snapshot()[0]['body']);
 
             $restarted->acknowledge('batch_exact');
+            self::assertFalse($restarted->contains('batch_exact'));
             self::assertSame(0, $restarted->pendingEvents());
             self::assertFileDoesNotExist($path);
         } finally {
@@ -179,6 +181,25 @@ final class FileBatchStoreTest extends TestCase
         file_put_contents($path, '{"version":1,"batches":[{"batchId":42}]}');
         try {
             $this->expectException(\RuntimeException::class);
+            new FileBatchStore($path);
+        } finally {
+            @unlink($path);
+        }
+    }
+
+    public function testDuplicateBatchIdsFailInitialization(): void
+    {
+        $path = (string) tempnam(sys_get_temp_dir(), 'alitycs-php-wal-');
+        file_put_contents(
+            $path,
+            '{"version":1,"batches":['
+            . '{"batchId":"duplicate","body":"{}","eventCount":1,"pausedUntilMs":null},'
+            . '{"batchId":"duplicate","body":"{}","eventCount":1,"pausedUntilMs":null}'
+            . ']}'
+        );
+        try {
+            $this->expectException(\RuntimeException::class);
+            $this->expectExceptionMessage('Duplicate Alitycs persistence record');
             new FileBatchStore($path);
         } finally {
             @unlink($path);

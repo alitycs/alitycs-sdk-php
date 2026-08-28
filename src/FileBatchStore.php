@@ -45,6 +45,9 @@ final class FileBatchStore
                 ) {
                     throw new \RuntimeException("Invalid Alitycs persistence record: $path");
                 }
+                if (isset($this->records[$record['batchId']])) {
+                    throw new \RuntimeException("Duplicate Alitycs persistence record: $path");
+                }
                 $this->records[$record['batchId']] = $record;
             }
             if ($this->pendingEvents() > $this->maxPendingEvents) {
@@ -135,6 +138,11 @@ final class FileBatchStore
     public function pendingEvents(): int
     {
         return array_sum(array_column($this->records, 'eventCount'));
+    }
+
+    public function contains(string $batchId): bool
+    {
+        return isset($this->records[$batchId]);
     }
 
     private function persist(): void

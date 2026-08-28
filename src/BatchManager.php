@@ -34,6 +34,7 @@ final class BatchManager
      * @param (\Closure(): float)|null $clock seconds-since-epoch; injectable for tests
      * @param (\Closure(): bool)|null $recover replays durable batches before new work
      * @param (\Closure(): int)|null $durablePending persisted event count
+     * @param (\Closure(BatchPayload): bool)|null $persist stores shutdown work without sending
      */
     public function __construct(
         private readonly Config $config,
@@ -42,6 +43,7 @@ final class BatchManager
         private readonly ?\Closure $recover = null,
         private readonly ?\Closure $durablePending = null,
         private readonly bool $durable = false,
+        private readonly ?\Closure $persist = null,
     ) {
         $this->lastFlushAttemptAt = $this->now();
     }
@@ -77,13 +79,7 @@ final class BatchManager
     /** Replays durable work, then sends everything currently queued. Never throws. */
     public function flush(): void
     {
-        try {
-            if ($this->recover !== null && ($this->recover)() !== true) {
-                return;
-            }
-        } catch (\Throwable $throwable) {
-            Log::warn('Durable batch recovery failed: ' . $throwable->getMessage());
-
+        if (!$this->recoverDurable()) {
             return;
         }
 
@@ -107,6 +103,71 @@ final class BatchManager
                 $this->lostTotal += count($events);
                 Log::warn('Batch dispatch failed — events dropped: ' . $throwable->getMessage());
             }
+        }
+    }
+
+    /** Drains normally, or durably persists queued work when older recovery is blocked. */
+    public function shutdown(): void
+    {
+        if ($this->recoverDurable()) {
+            // flush() performs its own recovery check so normal and shutdown drains
+            // share exactly one dispatch implementation. The second recovery is a
+            // cheap no-op after the first one drained the WAL.
+            $this->flush();
+
+            return;
+        }
+
+        $this->persistQueuedForShutdown();
+    }
+
+    private function recoverDurable(): bool
+    {
+        try {
+            return $this->recover === null || ($this->recover)() === true;
+        } catch (\Throwable $throwable) {
+            Log::warn('Durable batch recovery failed: ' . $throwable->getMessage());
+
+            return false;
+        }
+    }
+
+    /** Move accepted FIFO work to the WAL without overtaking an older durable batch. */
+    private function persistQueuedForShutdown(): void
+    {
+        if ($this->queue === []) {
+            return;
+        }
+
+        if (!$this->durable || $this->persist === null) {
+            $lost = count($this->queue);
+            $this->queue = [];
+            $this->lostTotal += $lost;
+            Log::warn("Shutdown could not deliver $lost queued event(s) — persistence unavailable");
+
+            return;
+        }
+
+        while ($this->queue !== []) {
+            $events = [$this->queue[0]];
+            $payload = new BatchPayload('batch_' . Utils::generateId(), Utils::nowMs(), $events);
+            try {
+                $persisted = ($this->persist)($payload) === true;
+            } catch (\Throwable $throwable) {
+                $persisted = false;
+                Log::warn('Shutdown persistence failed: ' . $throwable->getMessage());
+            }
+
+            if (!$persisted) {
+                $lost = count($this->queue);
+                $this->queue = [];
+                $this->lostTotal += $lost;
+                Log::warn("Shutdown persistence failed — $lost queued event(s) lost");
+
+                return;
+            }
+
+            array_shift($this->queue);
         }
     }
 

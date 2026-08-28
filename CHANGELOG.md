@@ -11,7 +11,8 @@ here before a version tag is created.
 - Optional `persistencePath` exact-batch write-ahead logging. A serialized in-flight batch is
   stored atomically before its first attempt and replayed byte-identically after restart,
   including any remaining final `Retry-After` deadline. Terminal responses acknowledge the WAL;
-  pre-flush in-memory events remain outside this durability boundary.
+  if older durable recovery is blocked during shutdown, accepted in-memory events are appended
+  to the WAL in FIFO batches instead of disappearing with the process.
 
 ### Added
 - Fork safety: a child process created after a client exists (`pcntl_fork()` or any other fork)

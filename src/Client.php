@@ -83,6 +83,7 @@ final class Client
                 recover: $this->transport->recover(...),
                 durablePending: $this->transport->pendingDurableEvents(...),
                 durable: $this->transport->durableEnabled(),
+                persist: $this->transport->persist(...),
             )
             : null;
 
@@ -332,7 +333,7 @@ final class Client
         // One attempt drains the in-memory queue. Durable transient batches remain on
         // disk for a later process instead of making shutdown loop forever.
         if ($this->batchManager !== null) {
-            $this->batchManager->flush();
+            $this->batchManager->shutdown();
         } else {
             $this->transport->recover();
         }
