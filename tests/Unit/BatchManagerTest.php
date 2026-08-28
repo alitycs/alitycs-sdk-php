@@ -206,6 +206,43 @@ final class BatchManagerTest extends TestCase
         $this->assertSame(1, $manager->lostTotal());
     }
 
+    public function testAuthenticationRejectionIsNotSplit(): void
+    {
+        $manager = $this->makeManagerWithSend(
+            new Config('k', ['flushSize' => 25, 'flushInterval' => 0]),
+            function (BatchPayload $payload): DeliveryResult {
+                $this->sent[] = $payload;
+
+                return DeliveryResult::rejected(401);
+            },
+        );
+        foreach (range(1, 10) as $index) {
+            $manager->add($this->event("auth-$index"));
+        }
+        $manager->flush();
+
+        $this->assertCount(1, $this->sent, 'an auth failure must not amplify into per-event requests');
+        $this->assertSame(10, $manager->lostTotal());
+    }
+
+    public function testBatchRejectionSplitIsBoundedToSixtyFourSends(): void
+    {
+        $manager = $this->makeManagerWithSend(
+            new Config('k', ['flushSize' => 100, 'flushInterval' => 0, 'maxQueueSize' => 100]),
+            function (BatchPayload $payload): DeliveryResult {
+                $this->sent[] = $payload;
+
+                return DeliveryResult::rejected(400);
+            },
+        );
+        foreach (range(1, 100) as $index) {
+            $manager->add($this->event("split-$index"));
+        }
+
+        $this->assertCount(64, $this->sent);
+        $this->assertSame(100, $manager->lostTotal());
+    }
+
     public function testRefusedDeliveriesAreCountedLostInsteadOfAccumulating(): void
     {
         // With maxQueueSize >= flushSize enforced, the queue cannot silently fill up:

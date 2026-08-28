@@ -36,8 +36,9 @@ final class HttpTransport
         private readonly bool $debug = false,
         private readonly ?\Closure $sleepMs = null,
         ?string $persistencePath = null,
+        int $maxPendingEvents = 1000,
     ) {
-        $this->store = new FileBatchStore($persistencePath);
+        $this->store = new FileBatchStore($persistencePath, $maxPendingEvents);
     }
 
     /** @return bool true when the batch was accepted (2xx). */
@@ -55,9 +56,15 @@ final class HttpTransport
             return false;
         }
 
-        $this->store->put($payload->batchId, $body, count($payload->events));
+        try {
+            $this->store->put($payload->batchId, $body, count($payload->events));
 
-        return $this->sendRecord($payload->batchId, $body)->isAccepted();
+            return $this->sendRecord($payload->batchId, $body)->isAccepted();
+        } catch (\Throwable $throwable) {
+            Log::warn('Transport persistence failed — delivery unresolved: ' . $throwable->getMessage());
+
+            return false;
+        }
     }
 
     /** Outcome-preserving form used by the batch manager. */
@@ -90,7 +97,10 @@ final class HttpTransport
                 }
             }
 
-            if (!$this->sendRecord($record['batchId'], $record['body'])->isAccepted()) {
+            $outcome = $this->sendRecord($record['batchId'], $record['body']);
+            // Terminal responses have already been acknowledged; only a transient
+            // failure stops ordered recovery of later records.
+            if ($outcome->isTransient()) {
                 return false;
             }
         }
@@ -108,6 +118,16 @@ final class HttpTransport
         return $this->store->enabled();
     }
 
+    public function resetForChild(): void
+    {
+        if ($this->store->resetForChild()) {
+            Log::warn(
+                'Fork detected — inherited persistence disabled in child; create a new client '
+                . 'with a child-specific persistencePath for durable child delivery'
+            );
+        }
+    }
+
     private function sendRecord(string $batchId, string $body): DeliveryResult
     {
 
@@ -117,11 +137,14 @@ final class HttpTransport
 
         for ($attempt = 0; $attempt <= $this->maxRetries; $attempt++) {
             if ($attempt > 0) {
-                // A 429's Retry-After replaces the default backoff for the attempt that
-                // follows it; the 10s cap still applies.
-                $delayMs = (int) min(self::BACKOFF_BASE_MS * 2 ** ($attempt - 1), self::BACKOFF_CAP_MS);
+                // SDK-generated exponential backoff is capped. A server Retry-After is
+                // authoritative and is therefore not shortened to that client cap.
+                $delayMs = (int) min(
+                    self::BACKOFF_BASE_MS * 2 ** min($attempt - 1, 30),
+                    self::BACKOFF_CAP_MS
+                );
                 if ($retryAfterMs !== null) {
-                    $delayMs = (int) min($retryAfterMs, self::BACKOFF_CAP_MS);
+                    $delayMs = $retryAfterMs;
                     $retryAfterMs = null;
                 }
                 $this->sleep($delayMs);
@@ -162,8 +185,12 @@ final class HttpTransport
             }
         }
 
-        $this->store->pause($batchId, $retryAfterUntilMs);
-        Log::warn("Transport: all retries exhausted — batch retained for restart: $lastError");
+        if ($this->store->enabled()) {
+            $this->store->pause($batchId, $retryAfterUntilMs);
+            Log::warn("Transport: all retries exhausted — batch retained for restart: $lastError");
+        } else {
+            Log::warn("Transport: all retries exhausted — batch not delivered: $lastError");
+        }
 
         return DeliveryResult::transient(
             str_starts_with($lastError, 'HTTP ') ? (int) substr($lastError, 5) : null,
@@ -186,7 +213,11 @@ final class HttpTransport
 
         $value = trim($value);
         if (preg_match('/^\d+$/', $value) === 1) {
-            return (int) $value * 1000;
+            $seconds = filter_var($value, FILTER_VALIDATE_INT, [
+                'options' => ['min_range' => 0, 'max_range' => intdiv(PHP_INT_MAX, 1000)],
+            ]);
+
+            return $seconds === false ? null : $seconds * 1000;
         }
 
         $timestamp = strtotime($value);

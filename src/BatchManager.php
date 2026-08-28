@@ -17,8 +17,8 @@ namespace Alitycs;
  */
 final class BatchManager
 {
-    /** Recursion guard for batch splitting: far beyond any realistic queue depth. */
-    private const MAX_SPLIT_DEPTH = 32;
+    /** Bound whole-batch rejection isolation so one response cannot create a request storm. */
+    private const MAX_SPLIT_SENDS = 64;
 
     /** @var list<AnalyticsEvent> */
     private array $queue = [];
@@ -97,7 +97,8 @@ final class BatchManager
         $this->queue = [];
 
         try {
-            $this->deliver($events, 0);
+            $remainingSends = self::MAX_SPLIT_SENDS;
+            $this->deliver($events, $remainingSends);
         } catch (\Throwable $throwable) {
             if ($this->durable) {
                 $this->queue = array_merge($events, $this->queue);
@@ -152,8 +153,17 @@ final class BatchManager
      *
      * @param list<AnalyticsEvent> $events
      */
-    private function deliver(array $events, int $depth): void
+    private function deliver(array $events, int &$remainingSends): void
     {
+        if ($remainingSends <= 0) {
+            $this->lostTotal += count($events);
+            Log::warn(
+                'Batch rejection split limit reached — dropping ' . count($events) . ' unresolved event(s)'
+            );
+
+            return;
+        }
+        $remainingSends--;
         $payload = new BatchPayload('batch_' . Utils::generateId(), Utils::nowMs(), $events);
 
         $rawOutcome = ($this->send)($payload);
@@ -167,10 +177,10 @@ final class BatchManager
             return;
         }
 
-        if ($outcome->isRejected() && count($events) > 1 && $depth < self::MAX_SPLIT_DEPTH) {
+        if ($outcome->isRejected() && $outcome->status === 400 && count($events) > 1) {
             $mid = intdiv(count($events), 2);
-            $this->deliver(array_slice($events, 0, $mid), $depth + 1);
-            $this->deliver(array_slice($events, $mid), $depth + 1);
+            $this->deliver(array_slice($events, 0, $mid), $remainingSends);
+            $this->deliver(array_slice($events, $mid), $remainingSends);
 
             return;
         }

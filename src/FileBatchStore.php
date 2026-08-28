@@ -15,8 +15,14 @@ final class FileBatchStore
     /** @var array<string, array{batchId: string, body: string, eventCount: int, pausedUntilMs: int|null}> */
     private array $records = [];
 
-    public function __construct(private readonly ?string $path)
+    private ?string $path;
+
+    public function __construct(?string $path, private readonly int $maxPendingEvents = 1000)
     {
+        if ($maxPendingEvents < 1) {
+            throw new \InvalidArgumentException('Alitycs persistence max pending events must be positive');
+        }
+        $this->path = $path;
         if ($path === null) {
             return;
         }
@@ -34,11 +40,17 @@ final class FileBatchStore
                     || !is_string($record['batchId'] ?? null)
                     || !is_string($record['body'] ?? null)
                     || !is_int($record['eventCount'] ?? null)
+                    || $record['eventCount'] < 1
                     || !is_null($record['pausedUntilMs'] ?? null) && !is_int($record['pausedUntilMs'] ?? null)
                 ) {
                     throw new \RuntimeException("Invalid Alitycs persistence record: $path");
                 }
                 $this->records[$record['batchId']] = $record;
+            }
+            if ($this->pendingEvents() > $this->maxPendingEvents) {
+                throw new \RuntimeException(
+                    "Alitycs persistence file exceeds the configured event limit: $path"
+                );
             }
         }
     }
@@ -53,14 +65,23 @@ final class FileBatchStore
         if (!$this->enabled() || isset($this->records[$batchId])) {
             return;
         }
+        if ($eventCount < 1 || $this->pendingEvents() + $eventCount > $this->maxPendingEvents) {
+            throw new \RuntimeException('Alitycs persistence event limit exceeded');
+        }
 
+        $previous = $this->records;
         $this->records[$batchId] = [
             'batchId' => $batchId,
             'body' => $body,
             'eventCount' => $eventCount,
             'pausedUntilMs' => null,
         ];
-        $this->persist();
+        try {
+            $this->persist();
+        } catch (\Throwable $throwable) {
+            $this->records = $previous;
+            throw $throwable;
+        }
     }
 
     public function acknowledge(string $batchId): void
@@ -69,8 +90,14 @@ final class FileBatchStore
             return;
         }
 
+        $previous = $this->records;
         unset($this->records[$batchId]);
-        $this->persist();
+        try {
+            $this->persist();
+        } catch (\Throwable $throwable) {
+            $this->records = $previous;
+            throw $throwable;
+        }
     }
 
     public function pause(string $batchId, ?int $pausedUntilMs): void
@@ -79,8 +106,24 @@ final class FileBatchStore
             return;
         }
 
+        $previous = $this->records;
         $this->records[$batchId]['pausedUntilMs'] = $pausedUntilMs;
-        $this->persist();
+        try {
+            $this->persist();
+        } catch (\Throwable $throwable) {
+            $this->records = $previous;
+            throw $throwable;
+        }
+    }
+
+    /** Detach a forked child from the parent-owned WAL and its inherited state. */
+    public function resetForChild(): bool
+    {
+        $inherited = $this->path !== null;
+        $this->path = null;
+        $this->records = [];
+
+        return $inherited;
     }
 
     /** @return list<array{batchId: string, body: string, eventCount: int, pausedUntilMs: int|null}> */
@@ -101,15 +144,16 @@ final class FileBatchStore
         }
 
         if ($this->records === []) {
-            if (is_file($this->path) && !unlink($this->path)) {
+            if (is_file($this->path) && !@unlink($this->path)) {
                 throw new \RuntimeException("Unable to remove Alitycs persistence file: {$this->path}");
             }
+            $this->syncDirectoryBestEffort(dirname($this->path));
 
             return;
         }
 
         $directory = dirname($this->path);
-        if (!is_dir($directory) && !mkdir($directory, 0700, true) && !is_dir($directory)) {
+        if (!is_dir($directory) && !@mkdir($directory, 0700, true) && !is_dir($directory)) {
             throw new \RuntimeException("Unable to create Alitycs persistence directory: $directory");
         }
 
@@ -122,15 +166,48 @@ final class FileBatchStore
             throw new \RuntimeException("Unable to create Alitycs persistence temporary file: $directory");
         }
 
+        $handle = null;
         try {
-            if (file_put_contents($temporary, $json, LOCK_EX) === false || !rename($temporary, $this->path)) {
+            $handle = @fopen($temporary, 'wb');
+            if ($handle === false || !flock($handle, LOCK_EX)) {
                 throw new \RuntimeException("Unable to persist Alitycs batches: {$this->path}");
             }
-            @chmod($this->path, 0600);
+            $offset = 0;
+            $length = strlen($json);
+            while ($offset < $length) {
+                $written = fwrite($handle, substr($json, $offset));
+                if ($written === false || $written === 0) {
+                    throw new \RuntimeException("Unable to persist Alitycs batches: {$this->path}");
+                }
+                $offset += $written;
+            }
+            if (!fflush($handle) || !fsync($handle)) {
+                throw new \RuntimeException("Unable to sync Alitycs batches: {$this->path}");
+            }
+            fclose($handle);
+            $handle = null;
+            @chmod($temporary, 0600);
+            if (!@rename($temporary, $this->path)) {
+                throw new \RuntimeException("Unable to replace Alitycs batches: {$this->path}");
+            }
+            $this->syncDirectoryBestEffort($directory);
         } finally {
+            if (is_resource($handle)) {
+                fclose($handle);
+            }
             if (is_file($temporary)) {
                 @unlink($temporary);
             }
         }
+    }
+
+    private function syncDirectoryBestEffort(string $directory): void
+    {
+        $handle = @fopen($directory, 'r');
+        if ($handle === false) {
+            return;
+        }
+        @fsync($handle);
+        fclose($handle);
     }
 }

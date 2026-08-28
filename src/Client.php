@@ -73,6 +73,7 @@ final class Client
             timeoutMs: $this->config->timeoutMs,
             debug: $this->config->debug,
             persistencePath: $this->config->persistencePath,
+            maxPendingEvents: $this->config->maxQueueSize,
         );
         $this->sessionManager = new SessionManager($this->config->sessionTimeout);
         $this->batchManager = $this->config->batching
@@ -128,6 +129,7 @@ final class Client
     private function resetForChild(): void
     {
         $this->batchManager?->resetForChild();
+        $this->transport->resetForChild();
         $this->sessionManager->resetForChild();
     }
 

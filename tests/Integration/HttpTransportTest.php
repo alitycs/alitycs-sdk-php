@@ -8,6 +8,7 @@ use Alitycs\AnalyticsEvent;
 use Alitycs\BatchPayload;
 use Alitycs\EventContext;
 use Alitycs\EventType;
+use Alitycs\FileBatchStore;
 use Alitycs\HttpTransport;
 use PHPUnit\Framework\TestCase;
 
@@ -113,13 +114,13 @@ final class HttpTransportTest extends TestCase
         $this->assertSame([1000], $this->sleeps);
     }
 
-    public function testHugeRetryAfterIsStillCappedAtTenSeconds(): void
+    public function testHugeRetryAfterIsNotShortenedToClientBackoffCap(): void
     {
         $transport = $this->transport(maxRetries: 1, statusPlan: '429,202', retryAfterPlan: '3600');
 
         $this->assertTrue($transport->send($this->payload()));
 
-        $this->assertSame([10_000], $this->sleeps);
+        $this->assertSame([3_600_000], $this->sleeps);
     }
 
     public function testClientErrorsAreNotRetried(): void
@@ -232,6 +233,23 @@ final class HttpTransportTest extends TestCase
             $restarted = $this->transport(maxRetries: 0, persistencePath: $path);
             $this->assertFalse($restarted->recover());
             $this->assertSame(1, $restarted->pendingDurableEvents());
+        } finally {
+            @unlink($path);
+        }
+    }
+
+    public function testTerminalRecoveryAcknowledgesAndContinues(): void
+    {
+        $path = sys_get_temp_dir() . '/alitycs-php-wal-' . bin2hex(random_bytes(6)) . '.json';
+        try {
+            $store = new FileBatchStore($path);
+            $store->put('batch_rejected', '{"batchId":"batch_rejected"}', 1);
+            $store->put('batch_healthy', '{"batchId":"batch_healthy"}', 1);
+            $restarted = $this->transport(maxRetries: 0, statusPlan: '400,202', persistencePath: $path);
+
+            $this->assertTrue($restarted->recover());
+            $this->assertSame(0, $restarted->pendingDurableEvents());
+            $this->assertCount(2, $this->server->requests());
         } finally {
             @unlink($path);
         }

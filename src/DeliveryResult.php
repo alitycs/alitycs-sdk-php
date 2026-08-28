@@ -42,4 +42,9 @@ final class DeliveryResult
     {
         return $this->kind === self::REJECTED;
     }
+
+    public function isTransient(): bool
+    {
+        return $this->kind === self::TRANSIENT;
+    }
 }
