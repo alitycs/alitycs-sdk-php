@@ -92,17 +92,10 @@ final class BatchManager
         $events = $this->queue;
         $this->queue = [];
 
-        try {
-            $remainingSends = self::MAX_SPLIT_SENDS;
-            $this->deliver($events, $remainingSends);
-        } catch (\Throwable $throwable) {
-            if ($this->durable) {
-                $this->queue = array_merge($events, $this->queue);
-                Log::warn('Batch dispatch failed — events retained in memory: ' . $throwable->getMessage());
-            } else {
-                $this->lostTotal += count($events);
-                Log::warn('Batch dispatch failed — events dropped: ' . $throwable->getMessage());
-            }
+        $remainingSends = self::MAX_SPLIT_SENDS;
+        $unresolved = $this->deliver($events, $remainingSends);
+        if ($unresolved !== []) {
+            $this->queue = array_merge($unresolved, $this->queue);
         }
     }
 
@@ -217,8 +210,9 @@ final class BatchManager
      * the original batch size.
      *
      * @param list<AnalyticsEvent> $events
+     * @return list<AnalyticsEvent> events whose dispatch threw before durable ownership
      */
-    private function deliver(array $events, int &$remainingSends): void
+    private function deliver(array $events, int &$remainingSends): array
     {
         if ($remainingSends <= 0) {
             $this->lostTotal += count($events);
@@ -226,12 +220,24 @@ final class BatchManager
                 'Batch rejection split limit reached — dropping ' . count($events) . ' unresolved event(s)'
             );
 
-            return;
+            return [];
         }
         $remainingSends--;
-        $payload = new BatchPayload('batch_' . Utils::generateId(), Utils::nowMs(), $events);
+        try {
+            $payload = new BatchPayload('batch_' . Utils::generateId(), Utils::nowMs(), $events);
+            $rawOutcome = ($this->send)($payload);
+        } catch (\Throwable $throwable) {
+            if ($this->durable) {
+                Log::warn('Batch dispatch failed — events retained in memory: ' . $throwable->getMessage());
 
-        $rawOutcome = ($this->send)($payload);
+                return $events;
+            }
+
+            $this->lostTotal += count($events);
+            Log::warn('Batch dispatch failed — events dropped: ' . $throwable->getMessage());
+
+            return [];
+        }
         $outcome = $rawOutcome instanceof DeliveryResult
             ? $rawOutcome
             : ($rawOutcome === true ? DeliveryResult::accepted(200) : DeliveryResult::rejected(400));
@@ -239,15 +245,15 @@ final class BatchManager
         if ($outcome->isAccepted()) {
             $this->deliveredTotal += count($events);
 
-            return;
+            return [];
         }
 
         if ($outcome->isRejected() && $outcome->status === 400 && count($events) > 1) {
             $mid = intdiv(count($events), 2);
-            $this->deliver(array_slice($events, 0, $mid), $remainingSends);
-            $this->deliver(array_slice($events, $mid), $remainingSends);
+            $left = $this->deliver(array_slice($events, 0, $mid), $remainingSends);
+            $right = $this->deliver(array_slice($events, $mid), $remainingSends);
 
-            return;
+            return array_merge($left, $right);
         }
 
         if ($outcome->isRejected()) {
@@ -257,17 +263,19 @@ final class BatchManager
                 . ' — dropped, not retried (re-queueing would poison future batches)'
             );
 
-            return;
+            return [];
         }
 
         if ($this->durable) {
             Log::warn('Transient delivery failure — exact batch retained for restart');
 
-            return;
+            return [];
         }
 
         $this->lostTotal += count($events);
         Log::warn('Transient delivery failure without persistence — ' . count($events) . ' event(s) lost');
+
+        return [];
     }
 
     private function now(): float

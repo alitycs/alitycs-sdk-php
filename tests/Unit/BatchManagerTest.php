@@ -280,6 +280,50 @@ final class BatchManagerTest extends TestCase
         $this->assertSame(0, $manager->lostTotal());
     }
 
+    public function testSplitExceptionRetainsOnlyTheUnresolvedBranch(): void
+    {
+        $attempted = [];
+        $failSecond = true;
+        $manager = new BatchManager(
+            new Config('k', ['flushSize' => 25, 'flushInterval' => 0]),
+            function (BatchPayload $payload) use (&$attempted, &$failSecond): DeliveryResult {
+                $names = $this->eventNames($payload);
+                $attempted[] = $names;
+                if (count($names) > 1) {
+                    return DeliveryResult::rejected(400);
+                }
+                if ($names[0] === 'b' && $failSecond) {
+                    throw new \RuntimeException('persistence unavailable');
+                }
+
+                return DeliveryResult::accepted(202);
+            },
+            clock: fn (): float => $this->now,
+            recover: static fn (): bool => true,
+            durablePending: static fn (): int => 0,
+            durable: true,
+        );
+        foreach (['a', 'b', 'c', 'd'] as $name) {
+            $manager->add($this->event($name));
+        }
+
+        $manager->flush();
+
+        $this->assertSame(1, $manager->pending(), 'only the throwing branch stays in memory');
+        $this->assertSame(3, $manager->deliveredTotal());
+        $this->assertSame(0, $manager->lostTotal());
+
+        $failSecond = false;
+        $manager->flush();
+
+        $this->assertSame(0, $manager->pending());
+        $this->assertSame(4, $manager->deliveredTotal());
+        $this->assertSame([['a'], ['b'], ['c'], ['d'], ['b']], array_values(array_filter(
+            $attempted,
+            static fn (array $names): bool => count($names) === 1,
+        )));
+    }
+
     public function testTransientFailureWithoutPersistenceIsCountedLost(): void
     {
         $manager = new BatchManager(
