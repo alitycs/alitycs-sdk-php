@@ -6,14 +6,17 @@ fork and long-running-worker safety, bounded delivery, and honest lifecycle outc
 Run these checks before opening a pull request:
 
 ```bash
-composer validate --strict
 composer install
+composer validate --strict
 composer test
 composer run test:coverage
 ./scripts/verify-workflow-pins.rb
 ./scripts/validate-coderabbit.sh
 ./scripts/test-coderabbit-policy.rb
 ```
+
+The CodeRabbit validator creates its own isolated Python environment and installs only the
+hash-locked requirements in `scripts/coderabbit-validator-requirements.txt`.
 
 Use private vulnerability reporting for security findings. Never commit credentials, customer
 data, vendor output, or local environment files. Keep `CHANGELOG.md` current.
