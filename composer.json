@@ -2,9 +2,13 @@
     "name": "alitycs/alitycs-sdk-php",
     "description": "Alitycs Analytics SDK for PHP — server-side event tracking with batching, sessions, and retry.",
     "type": "library",
-    "version": "1.0.0",
     "keywords": ["alitycs", "analytics", "events", "tracking"],
-    "license": "proprietary",
+    "license": "MIT",
+    "homepage": "https://github.com/alitycs/alitycs-sdk-php",
+    "support": {
+        "issues": "https://github.com/alitycs/alitycs-sdk-php/issues",
+        "source": "https://github.com/alitycs/alitycs-sdk-php"
+    },
     "require": {
         "php": ">=8.1",
         "ext-curl": "*",
