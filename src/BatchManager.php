@@ -107,10 +107,10 @@ final class BatchManager
             // share exactly one dispatch implementation. The second recovery is a
             // cheap no-op after the first one drained the WAL.
             $this->flush();
-
-            return;
         }
 
+        // A dispatch exception can return an unresolved branch to memory even after
+        // recovery succeeded. Give that remainder durable ownership before exit.
         $this->persistQueuedForShutdown();
     }
 

@@ -145,6 +145,54 @@ final class ClientIntegrationTest extends TestCase
         ], $usersByEvent);
     }
 
+    public function testEveryEventApiResolvesOmittedAndBlankPerCallUsers(): void
+    {
+        $this->startClient(['flushSize' => 20]);
+        $this->client->identify('usr_ambient');
+
+        $this->client->track('ambient_track', ['scope' => 'ambient']);
+        $this->client->captureError('ambient_error', ['scope' => 'ambient']);
+        $this->client->page('ambient_page', ['scope' => 'ambient']);
+        $this->client->trackRevenue(
+            RevenuePayload::transaction('ambient_fact', '5.00', 'USD'),
+            ['scope' => 'ambient'],
+        );
+
+        $this->client->track('blank_track', ['scope' => 'blank'], userId: '');
+        $this->client->captureError('blank_error', ['scope' => 'blank'], userId: '');
+        $this->client->page('blank_page', ['scope' => 'blank'], userId: '');
+        $this->client->trackRevenue(
+            RevenuePayload::transaction('blank_fact', '5.00', 'USD'),
+            ['scope' => 'blank'],
+            userId: '',
+        );
+        $this->client->flush();
+
+        $events = $this->server->requests()[0]['body']['events'];
+        $scoped = array_values(array_filter(
+            $events,
+            static fn (array $event): bool => isset($event['properties']['scope']),
+        ));
+        $this->assertCount(8, $scoped);
+        foreach ($scoped as $event) {
+            if ($event['properties']['scope'] === 'ambient') {
+                $this->assertSame('usr_ambient', $event['userId']);
+            } else {
+                $this->assertArrayNotHasKey('userId', $event);
+            }
+        }
+        $this->assertSame([
+            'ambient_track',
+            'ambient_error',
+            'ambient_page',
+            'revenue_transaction',
+            'blank_track',
+            'blank_error',
+            'blank_page',
+            'revenue_transaction',
+        ], array_column($scoped, 'event'));
+    }
+
     public function testGlobalPropertiesMergeOverrideAndRemove(): void
     {
         $this->startClient();

@@ -438,6 +438,37 @@ final class BatchManagerTest extends TestCase
         $this->assertSame(2, $manager->lostTotal());
     }
 
+    public function testShutdownPersistsAQueuedBranchAfterDispatchThrows(): void
+    {
+        $durablePending = 0;
+        $persisted = [];
+        $manager = new BatchManager(
+            new Config('k', ['flushSize' => 25, 'flushInterval' => 0]),
+            static function (): DeliveryResult {
+                throw new \RuntimeException('persistence unavailable');
+            },
+            clock: fn (): float => $this->now,
+            recover: static fn (): bool => true,
+            durablePending: static function () use (&$durablePending): int {
+                return $durablePending;
+            },
+            durable: true,
+            persist: function (BatchPayload $payload) use (&$durablePending, &$persisted): bool {
+                $persisted[] = $payload;
+                $durablePending += count($payload->events);
+
+                return true;
+            },
+        );
+        $manager->add($this->event('shutdown-remainder'));
+
+        $manager->shutdown();
+
+        $this->assertSame(['shutdown-remainder'], $this->eventNames($persisted[0]));
+        $this->assertSame(1, $manager->pending());
+        $this->assertSame(0, $manager->lostTotal());
+    }
+
     // ------------------------------------------------------------------ fork safety
 
     public function testResetForChildHandsInheritedEventsBackToTheParent(): void

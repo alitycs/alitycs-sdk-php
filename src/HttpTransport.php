@@ -131,7 +131,13 @@ final class HttpTransport
                 return false;
             }
 
-            $outcome = $this->sendRecord($record['batchId'], $record['body']);
+            try {
+                $outcome = $this->sendRecord($record['batchId'], $record['body']);
+            } catch (\Throwable $throwable) {
+                Log::warn('Durable replay failed — batch retained: ' . $throwable->getMessage());
+
+                return false;
+            }
             // Terminal responses have already been acknowledged; only a transient
             // failure stops ordered recovery of later records.
             if ($outcome->isTransient()) {

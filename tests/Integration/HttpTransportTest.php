@@ -300,6 +300,34 @@ final class HttpTransportTest extends TestCase
         }
     }
 
+    public function testRecoveryContainsAcknowledgeFailureAndRetainsTheWal(): void
+    {
+        $path = sys_get_temp_dir() . '/alitycs-php-wal-' . bin2hex(random_bytes(6)) . '.json';
+        $blockingDirectory = sys_get_temp_dir() . '/alitycs-php-block-' . bin2hex(random_bytes(6));
+        mkdir($blockingDirectory, 0700);
+        file_put_contents($blockingDirectory . '/marker', 'keep non-empty');
+        try {
+            $store = new FileBatchStore($path);
+            $store->put('batch_first', '{"batchId":"batch_first"}', 1);
+            $store->put('batch_second', '{"batchId":"batch_second"}', 1);
+            $transport = $this->transport(maxRetries: 0, persistencePath: $path);
+            $transportStore = (new \ReflectionProperty(HttpTransport::class, 'store'))->getValue($transport);
+            self::assertInstanceOf(FileBatchStore::class, $transportStore);
+            (new \ReflectionProperty(FileBatchStore::class, 'path'))->setValue(
+                $transportStore,
+                $blockingDirectory,
+            );
+
+            $this->assertFalse($transport->recover());
+            $this->assertSame(2, $transport->pendingDurableEvents());
+            $this->assertCount(1, $this->server->requests());
+        } finally {
+            @unlink($path);
+            @unlink($blockingDirectory . '/marker');
+            @rmdir($blockingDirectory);
+        }
+    }
+
     // ---------------------------------------------------------------------- helpers
 
     private function transport(

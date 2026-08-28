@@ -312,9 +312,10 @@ final class Client
     }
 
     /**
-     * Stops accepting events and delivers everything still queued — after it returns,
-     * every enqueued event has been sent or permanently dropped by the transport's retry
-     * policy. Idempotent; also invoked automatically at script shutdown.
+     * Stops accepting events and resolves everything still queued — after it returns,
+     * every enqueued event has been sent, durably retained, or permanently dropped and
+     * counted by the transport's retry policy. Idempotent; also invoked automatically at
+     * script shutdown.
      */
     public function shutdown(): void
     {

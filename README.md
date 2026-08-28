@@ -42,10 +42,11 @@ are delivered by exactly three triggers:
 3. **Script shutdown** — via `register_shutdown_function()`, so a request that ends
    without an explicit flush still delivers.
 
-`shutdown()` drains fully and never loses queued events; it is safe to call more than
-once. After it returns, every enqueued event has been sent or permanently dropped under
-the retry policy below. Events enqueued after `shutdown()` are ignored (logged in debug
-mode), because there is nothing left to deliver them.
+`shutdown()` drains fully and never silently loses queued events; it is safe to call more
+than once. After it returns, every enqueued event has been sent, durably retained, or
+permanently dropped and counted under the retry policy below. Events enqueued after
+`shutdown()` are ignored (logged in debug mode), because there is nothing left to deliver
+them.
 
 `flushInterval` exists for API parity but is **opportunistic**: it is never a timer. It
 is checked only while events keep arriving — each enqueue compares elapsed wall time
@@ -82,6 +83,8 @@ $alitycs->captureError('checkout_failed', ['code' => 'E_CARD'], userId: $request
 ```
 
 The same optional argument is available on `trackRevenue()` and `page()`.
+Omitting it uses the ambient identity from `identify()`; passing a blank string explicitly
+suppresses that ambient identity for the individual event.
 
 Queued but unsent events are **not** dropped by `resetForRequest()`; flush beforehand if
 they should be delivered before the identities change. For Swoole coroutine workers,
