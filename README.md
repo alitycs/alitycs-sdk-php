@@ -109,15 +109,16 @@ Unknown option names throw — a typo fails loudly instead of running on default
 
 Batches are retried with exponential backoff (1s, 2s, 4s … capped at 10s) on `5xx`,
 `429`, and network errors, up to `maxRetries` times. Any other `4xx` is permanent and is
-never retried. A server `Retry-After` value replaces the generated delay and is not shortened
-to the 10s client-backoff cap. Delivery failures are logged, never thrown — a dead endpoint cannot fatal
-your application. Without persistence, an exhausted transient batch is lost. With
-`persistencePath`, the exact serialized batch is atomically retained and the next process replays
-it on `flush()`/`shutdown()`, including any remaining `Retry-After` pause. Terminal responses
-acknowledge and remove it. The WAL covers batches that reached transport, not events still waiting
-in the PHP queue, and is capped at `maxQueueSize` retained events. Configure one process owner per
-path. After a fork, the child detaches from the inherited parent WAL; create a fresh client with a
-child-specific `persistencePath` when child delivery must also be durable.
+never retried. A server `Retry-After` value replaces the generated delay and uses a separate 60s
+safety bound rather than the 10s client-backoff cap. Delivery failures are logged, never thrown —
+a dead endpoint cannot fatal your application. Without persistence, an exhausted transient batch
+is lost. With `persistencePath`, the exact serialized batch is atomically retained. A later
+`flush()`/`shutdown()` replays it byte-identically after any remaining `Retry-After` pause has
+elapsed; it returns promptly while a pause is still active. Terminal responses acknowledge and
+remove the record. The WAL also accepts queued events during a blocked shutdown and is capped at
+`maxQueueSize` retained events. Configure one process owner per path. After a fork, the child
+detaches from the inherited parent WAL; create a fresh client with a child-specific
+`persistencePath` when child delivery must also be durable.
 
 ## Revenue
 

@@ -412,6 +412,25 @@ final class BatchManagerTest extends TestCase
         );
     }
 
+    public function testResetForChildDisablesInheritedDurabilityForLossAccounting(): void
+    {
+        $manager = new BatchManager(
+            new Config('k', ['flushSize' => 25, 'flushInterval' => 0]),
+            static fn (): DeliveryResult => DeliveryResult::transient(503),
+            clock: fn (): float => $this->now,
+            recover: static fn (): bool => true,
+            durablePending: static fn (): int => 0,
+            durable: true,
+        );
+
+        $manager->resetForChild();
+        $manager->add($this->event('child-transient'));
+        $manager->flush();
+
+        $this->assertSame(0, $manager->pending());
+        $this->assertSame(1, $manager->lostTotal());
+    }
+
     // ---------------------------------------------------------------------- helpers
 
     private function makeManager(Config $config): BatchManager

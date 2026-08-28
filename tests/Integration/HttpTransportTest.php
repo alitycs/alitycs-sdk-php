@@ -114,13 +114,22 @@ final class HttpTransportTest extends TestCase
         $this->assertSame([1000], $this->sleeps);
     }
 
-    public function testHugeRetryAfterIsNotShortenedToClientBackoffCap(): void
+    public function testHugeRetryAfterUsesTheSeparateServerDelayCap(): void
     {
         $transport = $this->transport(maxRetries: 1, statusPlan: '429,202', retryAfterPlan: '3600');
 
         $this->assertTrue($transport->send($this->payload()));
 
-        $this->assertSame([3_600_000], $this->sleeps);
+        $this->assertSame([60_000], $this->sleeps);
+    }
+
+    public function testFarFutureRetryAfterHttpDateUsesTheServerDelayCap(): void
+    {
+        $transport = $this->transport();
+        $parse = new \ReflectionMethod(HttpTransport::class, 'parseRetryAfterMs');
+        $future = gmdate('D, d M Y H:i:s \G\M\T', time() + 3600);
+
+        $this->assertSame(60_000, $parse->invoke($transport, ['retry-after' => [$future]]));
     }
 
     public function testClientErrorsAreNotRetried(): void
@@ -236,7 +245,7 @@ final class HttpTransportTest extends TestCase
         }
     }
 
-    public function testRestartHonoursPersistedRetryAfterDeadline(): void
+    public function testRestartDefersPersistedRetryAfterWithoutSleeping(): void
     {
         $path = sys_get_temp_dir() . '/alitycs-php-wal-' . bin2hex(random_bytes(6)) . '.json';
         try {
@@ -250,9 +259,10 @@ final class HttpTransportTest extends TestCase
             $this->sleeps = [];
 
             $restarted = $this->transport(maxRetries: 0, persistencePath: $path);
-            $this->assertTrue($restarted->recover());
-            $this->assertNotEmpty($this->sleeps);
-            $this->assertGreaterThanOrEqual(2500, $this->sleeps[0]);
+            $this->assertFalse($restarted->recover());
+            $this->assertSame([], $this->sleeps);
+            $this->assertSame(1, $restarted->pendingDurableEvents());
+            $this->assertCount(1, $this->server->requests(), 'recovery must not overtake the pause');
         } finally {
             @unlink($path);
         }

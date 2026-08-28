@@ -13,8 +13,6 @@ here before a version tag is created.
   including any remaining final `Retry-After` deadline. Terminal responses acknowledge the WAL;
   if older durable recovery is blocked during shutdown, accepted in-memory events are appended
   to the WAL in FIFO batches instead of disappearing with the process.
-
-### Added
 - Fork safety: a child process created after a client exists (`pcntl_fork()` or any other fork)
   no longer inherits the parent's queue. The first SDK call in the child detects the new process
   id, drops inherited-but-unsent events (the parent still delivers them — previously both
@@ -31,7 +29,7 @@ here before a version tag is created.
   See "Long-running workers" in the README.
 - A 429 response's `Retry-After` header (delta-seconds or HTTP-date) is now honoured: the retry
   after it waits at least that long instead of the default backoff. Only SDK-generated exponential
-  backoff is capped at 10s; server deadlines are not shortened.
+  backoff is capped at 10s; server deadlines use a separate 60s safety bound.
 - Client-side enforcement of the canonical ingestion limits (identical to the server's
   `EventValidator`): ≤50 properties per event, property keys ≤100 chars, values ≤1000 chars,
   estimated event size ≤64KB, non-blank action plus `userId`/`anonymousId` required, epoch-millis

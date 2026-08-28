@@ -42,7 +42,7 @@ final class BatchManager
         private readonly ?\Closure $clock = null,
         private readonly ?\Closure $recover = null,
         private readonly ?\Closure $durablePending = null,
-        private readonly bool $durable = false,
+        private bool $durable = false,
         private readonly ?\Closure $persist = null,
     ) {
         $this->lastFlushAttemptAt = $this->now();
@@ -186,6 +186,10 @@ final class BatchManager
             );
         }
         $this->queue = [];
+        // Client resets the transport immediately after this manager. Clear our cached
+        // durability too so transient child failures are counted as lost once the
+        // inherited parent-owned WAL has been detached.
+        $this->durable = false;
         $this->lastFlushAttemptAt = $this->now();
     }
 

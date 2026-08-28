@@ -26,8 +26,24 @@ $endpoint = (string) getenv('ALITYCS_ENDPOINT');
 $runId = (string) getenv('ALITYCS_RUN_ID');
 $phase = trim((string) getenv('ALITYCS_E2E_PHASE'));
 $stateFile = trim((string) getenv('ALITYCS_STATE_FILE'));
+if (!in_array($phase, ['', 'first', 'restart'], true)) {
+    fwrite(STDERR, "ALITYCS_E2E_PHASE must be first, restart, or empty\n");
+    exit(1);
+}
+if ($phase !== '' && $stateFile === '') {
+    fwrite(STDERR, "ALITYCS_STATE_FILE is required for restart phases\n");
+    exit(1);
+}
 if ($phase === 'first') {
-    $endpoint = (string) getenv('ALITYCS_FAILURE_ENDPOINT');
+    $endpoint = trim((string) getenv('ALITYCS_FAILURE_ENDPOINT'));
+    if ($endpoint === '') {
+        fwrite(STDERR, "ALITYCS_FAILURE_ENDPOINT is required for the first phase\n");
+        exit(1);
+    }
+    if (!function_exists('pcntl_exec')) {
+        fwrite(STDERR, "ext-pcntl is required for the restart scenario\n");
+        exit(1);
+    }
 }
 
 $eventName = "sdk_php_track_$runId";

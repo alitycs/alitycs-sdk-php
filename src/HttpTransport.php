@@ -21,6 +21,7 @@ final class HttpTransport
 {
     private const BACKOFF_BASE_MS = 1000;
     private const BACKOFF_CAP_MS = 10_000;
+    private const RETRY_AFTER_CAP_MS = 60_000;
 
     private readonly FileBatchStore $store;
 
@@ -124,11 +125,10 @@ final class HttpTransport
     {
         foreach ($this->store->snapshot() as $record) {
             $pausedUntilMs = $record['pausedUntilMs'];
-            if ($pausedUntilMs !== null) {
-                $remainingMs = max(0, $pausedUntilMs - self::nowMs());
-                if ($remainingMs > 0) {
-                    $this->sleep($remainingMs);
-                }
+            if ($pausedUntilMs !== null && $pausedUntilMs > self::nowMs()) {
+                // The record is already durable. Preserve FIFO ordering and let a
+                // later flush retry after the pause instead of blocking this caller.
+                return false;
             }
 
             $outcome = $this->sendRecord($record['batchId'], $record['body']);
@@ -251,7 +251,9 @@ final class HttpTransport
                 'options' => ['min_range' => 0, 'max_range' => intdiv(PHP_INT_MAX, 1000)],
             ]);
 
-            return $seconds === false ? null : $seconds * 1000;
+            return $seconds === false
+                ? null
+                : min($seconds * 1000, self::RETRY_AFTER_CAP_MS);
         }
 
         $timestamp = strtotime($value);
@@ -259,7 +261,7 @@ final class HttpTransport
             return null;
         }
 
-        return max(0, $timestamp - time()) * 1000;
+        return min(max(0, $timestamp - time()) * 1000, self::RETRY_AFTER_CAP_MS);
     }
 
     /**

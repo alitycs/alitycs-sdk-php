@@ -119,15 +119,12 @@ final class FileBatchStoreTest extends TestCase
     {
         $path = sys_get_temp_dir() . '/alitycs-php-wal-' . bin2hex(random_bytes(6)) . '.json';
         $blockingDirectory = sys_get_temp_dir() . '/alitycs-php-block-' . bin2hex(random_bytes(6));
-        $readOnlyDirectory = sys_get_temp_dir() . '/alitycs-php-readonly-' . bin2hex(random_bytes(6));
-        $readOnlyPath = $readOnlyDirectory . '/wal.json';
         mkdir($blockingDirectory, 0700);
         file_put_contents($blockingDirectory . '/marker', 'keep non-empty');
-        mkdir($readOnlyDirectory, 0700);
-        file_put_contents($readOnlyPath, '{}');
         try {
             $store = new FileBatchStore($path);
             $store->put('batch', '{}', 1);
+            $store->put('batch_other', '{}', 1);
             (new \ReflectionProperty(FileBatchStore::class, 'path'))->setValue($store, $blockingDirectory);
 
             try {
@@ -136,21 +133,16 @@ final class FileBatchStoreTest extends TestCase
             } catch (\RuntimeException) {
                 self::assertNull($store->snapshot()[0]['pausedUntilMs']);
             }
-            chmod($readOnlyDirectory, 0500);
-            (new \ReflectionProperty(FileBatchStore::class, 'path'))->setValue($store, $readOnlyPath);
             try {
                 $store->acknowledge('batch');
                 $this->fail('acknowledge unexpectedly succeeded');
             } catch (\RuntimeException) {
-                self::assertSame(1, $store->pendingEvents());
+                self::assertSame(2, $store->pendingEvents());
             }
         } finally {
             @unlink($path);
             @unlink($blockingDirectory . '/marker');
             @rmdir($blockingDirectory);
-            @chmod($readOnlyDirectory, 0700);
-            @unlink($readOnlyPath);
-            @rmdir($readOnlyDirectory);
         }
     }
 
