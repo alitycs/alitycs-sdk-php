@@ -5,6 +5,14 @@ here before a version tag is created.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-28
+
+### Added
+- Optional `persistencePath` exact-batch write-ahead logging. A serialized in-flight batch is
+  stored atomically before its first attempt and replayed byte-identically after restart,
+  including any remaining final `Retry-After` deadline. Terminal responses acknowledge the WAL;
+  pre-flush in-memory events remain outside this durability boundary.
+
 ### Added
 - Fork safety: a child process created after a client exists (`pcntl_fork()` or any other fork)
   no longer inherits the parent's queue. The first SDK call in the child detects the new process
@@ -55,3 +63,6 @@ here before a version tag is created.
 - Delivery failures are logged at warn level even when `debug` is off; dropped batches were
   previously invisible by default.
 - Queue-overflow drops increment `lostTotal` and log at warn level.
+
+[Unreleased]: https://github.com/alitycs/alitycs-sdk-php/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/alitycs/alitycs-sdk-php/releases/tag/v1.0.0
