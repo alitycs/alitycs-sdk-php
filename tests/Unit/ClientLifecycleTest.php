@@ -82,6 +82,16 @@ final class ClientLifecycleTest extends TestCase
         $client->shutdown();
     }
 
+    public function testPidMismatchLazilyAdoptsTheCurrentProcess(): void
+    {
+        $client = $this->makeClient();
+        $client->track('belongs_to_parent');
+        $creatorPid = new \ReflectionProperty(Client::class, 'creatorPid');
+        $creatorPid->setValue(null, (getmypid() ?: 1) + 1);
+
+        $this->assertSame(0, $client->pending());
+    }
+
     public function testResetForChildProcessKeepsGlobalPropertiesAndRotatesTheSessionId(): void
     {
         $client = $this->makeClient();
@@ -108,6 +118,17 @@ final class ClientLifecycleTest extends TestCase
         $snapshot = new \ReflectionMethod(Client::class, 'snapshotLiveClients');
 
         $this->assertSame([], $snapshot->invoke(null));
+    }
+
+    public function testProcessShutdownHandlerDrainsAndDeregistersLiveClients(): void
+    {
+        $client = $this->makeClient();
+        $flushAll = new \ReflectionMethod(Client::class, 'flushAllAtShutdown');
+
+        $flushAll->invoke(null);
+
+        $this->assertTrue(self::isClosed($client));
+        $this->assertSame(0, self::liveCount());
     }
 
     public function testUnbatchedDeliveryFailureDoesNotQueueTheEvent(): void

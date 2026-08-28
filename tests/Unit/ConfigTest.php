@@ -23,6 +23,7 @@ final class ConfigTest extends TestCase
         $this->assertSame(30 * 60 * 1000, $config->sessionTimeout);
         $this->assertFalse($config->debug);
         $this->assertTrue($config->batching);
+        $this->assertNull($config->persistencePath);
         $this->assertSame('pk_test', $config->apiKey());
     }
 
@@ -38,6 +39,7 @@ final class ConfigTest extends TestCase
             'sessionTimeout' => 60_000,
             'debug' => true,
             'batching' => false,
+            'persistencePath' => '/tmp/alitycs-wal.json',
         ]);
 
         $this->assertSame('http://127.0.0.1:9999/events', $config->endpoint);
@@ -49,6 +51,7 @@ final class ConfigTest extends TestCase
         $this->assertSame(60_000, $config->sessionTimeout);
         $this->assertTrue($config->debug);
         $this->assertFalse($config->batching);
+        $this->assertSame('/tmp/alitycs-wal.json', $config->persistencePath);
     }
 
     public static function invalidConfigProvider(): \Generator
@@ -71,6 +74,8 @@ final class ConfigTest extends TestCase
         yield 'sessionTimeout zero' => ['apiKey' => 'k', 'options' => ['sessionTimeout' => 0]];
         yield 'debug not a bool' => ['apiKey' => 'k', 'options' => ['debug' => 1]];
         yield 'batching not a bool' => ['apiKey' => 'k', 'options' => ['batching' => 'yes']];
+        yield 'persistencePath blank' => ['apiKey' => 'k', 'options' => ['persistencePath' => '  ']];
+        yield 'persistencePath not a string' => ['apiKey' => 'k', 'options' => ['persistencePath' => 42]];
     }
 
     #[DataProvider('invalidConfigProvider')]

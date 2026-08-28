@@ -5,7 +5,14 @@ here before a version tag is created.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-28
+
 ### Added
+- Optional `persistencePath` exact-batch write-ahead logging. A serialized in-flight batch is
+  stored atomically before its first attempt and replayed byte-identically after restart,
+  including any remaining final `Retry-After` deadline. Terminal responses acknowledge the WAL;
+  if older durable recovery is blocked during shutdown, accepted in-memory events are appended
+  to the WAL in FIFO batches instead of disappearing with the process.
 - Fork safety: a child process created after a client exists (`pcntl_fork()` or any other fork)
   no longer inherits the parent's queue. The first SDK call in the child detects the new process
   id, drops inherited-but-unsent events (the parent still delivers them — previously both
@@ -21,8 +28,8 @@ here before a version tag is created.
   longer be attributed to the next request's events. Queued but unsent events are not dropped.
   See "Long-running workers" in the README.
 - A 429 response's `Retry-After` header (delta-seconds or HTTP-date) is now honoured: the retry
-  after it waits at least that long instead of the default backoff, still capped at 10s.
-  Previously the header was ignored and rate-limited clients hammered through the rate limit.
+  after it waits at least that long instead of the default backoff. Only SDK-generated exponential
+  backoff is capped at 10s; server deadlines use a separate 60s safety bound.
 - Client-side enforcement of the canonical ingestion limits (identical to the server's
   `EventValidator`): ≤50 properties per event, property keys ≤100 chars, values ≤1000 chars,
   estimated event size ≤64KB, non-blank action plus `userId`/`anonymousId` required, epoch-millis
@@ -55,3 +62,14 @@ here before a version tag is created.
 - Delivery failures are logged at warn level even when `debug` is off; dropped batches were
   previously invisible by default.
 - Queue-overflow drops increment `lostTotal` and log at warn level.
+- Fork repair now also detaches the child from the parent-owned WAL, preventing duplicate replay
+  and cross-process snapshot corruption. Durable child delivery requires a fresh client with a
+  child-specific `persistencePath`.
+- WAL growth is capped by `maxQueueSize`; mutations roll back in-memory state after write failures,
+  fsync file contents before replacement, and best-effort fsync directory metadata. Terminal
+  durable rejections no longer block later replay.
+- Only HTTP 400 whole-batch rejections are split. Authentication, authorization, redirect, and
+  other permanent failures are dropped once, and split isolation is capped at 64 sends.
+
+[Unreleased]: https://github.com/alitycs/alitycs-sdk-php/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/alitycs/alitycs-sdk-php/releases/tag/v1.0.0

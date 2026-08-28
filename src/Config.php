@@ -47,6 +47,9 @@ final class Config
     /** When false, every event is sent immediately as its own single-event batch. */
     public readonly bool $batching;
 
+    /** Optional path for the exact serialized in-flight batch write-ahead log. */
+    public readonly ?string $persistencePath;
+
     private readonly string $apiKey;
 
     private const KNOWN_OPTIONS = [
@@ -59,6 +62,7 @@ final class Config
         'sessionTimeout',
         'debug',
         'batching',
+        'persistencePath',
     ];
 
     /**
@@ -86,6 +90,7 @@ final class Config
         $this->sessionTimeout = self::intOption($options, 'sessionTimeout', 30 * 60 * 1000, min: 1);
         $this->debug = self::boolOption($options, 'debug', false);
         $this->batching = self::boolOption($options, 'batching', true);
+        $this->persistencePath = self::nullableStringOption($options, 'persistencePath');
 
         // Cross-check: the queue cap must leave room for the size trigger to fire. Below
         // flushSize, `add()` starts dropping arrivals before the queue ever reaches the
@@ -158,6 +163,21 @@ final class Config
         $value = $options[$key] ?? $default;
         if (!is_bool($value)) {
             throw new \InvalidArgumentException("Config option \"$key\" must be a boolean");
+        }
+
+        return $value;
+    }
+
+    /** @param array<string, mixed> $options */
+    private static function nullableStringOption(array $options, string $key): ?string
+    {
+        if (!array_key_exists($key, $options) || $options[$key] === null) {
+            return null;
+        }
+
+        $value = $options[$key];
+        if (!is_string($value) || trim($value) === '') {
+            throw new \InvalidArgumentException("Config option \"$key\" must be null or a non-empty string");
         }
 
         return $value;

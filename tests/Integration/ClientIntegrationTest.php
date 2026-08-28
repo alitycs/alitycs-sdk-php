@@ -99,6 +99,100 @@ final class ClientIntegrationTest extends TestCase
         $this->assertArrayNotHasKey('userId', $afterTrack);
     }
 
+    public function testSharedClientKeepsInterleavedPerCallUsersIsolated(): void
+    {
+        $this->startClient(['flushSize' => 100]);
+
+        for ($index = 0; $index < 25; $index++) {
+            $this->client->track("request_a_$index", userId: 'usr_request_a');
+            $this->client->track("request_b_$index", userId: 'usr_request_b');
+        }
+        $this->client->flush();
+
+        $events = $this->server->requests()[0]['body']['events'];
+        $this->assertCount(50, $events);
+        foreach ($events as $event) {
+            $expected = str_starts_with($event['event'], 'request_a_')
+                ? 'usr_request_a'
+                : 'usr_request_b';
+            $this->assertSame($expected, $event['userId'], $event['event']);
+        }
+    }
+
+    public function testPerCallUserAppliesToEveryEventApi(): void
+    {
+        $this->startClient(['flushSize' => 10]);
+
+        $this->client->track('scoped_track', userId: 'usr_track');
+        $this->client->captureError('scoped_error', userId: 'usr_error');
+        $this->client->page('scoped_page', userId: 'usr_page');
+        $this->client->trackRevenue(
+            RevenuePayload::transaction('scoped_fact', '5.00', 'USD'),
+            userId: 'usr_revenue',
+        );
+        $this->client->flush();
+
+        $events = $this->server->requests()[0]['body']['events'];
+        $usersByEvent = [];
+        foreach ($events as $event) {
+            $usersByEvent[$event['event']] = $event['userId'];
+        }
+        $this->assertSame([
+            'scoped_track' => 'usr_track',
+            'scoped_error' => 'usr_error',
+            'scoped_page' => 'usr_page',
+            'revenue_transaction' => 'usr_revenue',
+        ], $usersByEvent);
+    }
+
+    public function testEveryEventApiResolvesOmittedAndBlankPerCallUsers(): void
+    {
+        $this->startClient(['flushSize' => 20]);
+        $this->client->identify('usr_ambient');
+
+        $this->client->track('ambient_track', ['scope' => 'ambient']);
+        $this->client->captureError('ambient_error', ['scope' => 'ambient']);
+        $this->client->page('ambient_page', ['scope' => 'ambient']);
+        $this->client->trackRevenue(
+            RevenuePayload::transaction('ambient_fact', '5.00', 'USD'),
+            ['scope' => 'ambient'],
+        );
+
+        $this->client->track('blank_track', ['scope' => 'blank'], userId: '');
+        $this->client->captureError('blank_error', ['scope' => 'blank'], userId: '');
+        $this->client->page('blank_page', ['scope' => 'blank'], userId: '');
+        $this->client->trackRevenue(
+            RevenuePayload::transaction('blank_fact', '5.00', 'USD'),
+            ['scope' => 'blank'],
+            userId: '',
+        );
+        $this->client->flush();
+
+        $events = $this->server->requests()[0]['body']['events'];
+        $scoped = array_values(array_filter(
+            $events,
+            static fn (array $event): bool => isset($event['properties']['scope']),
+        ));
+        $this->assertCount(8, $scoped);
+        foreach ($scoped as $event) {
+            if ($event['properties']['scope'] === 'ambient') {
+                $this->assertSame('usr_ambient', $event['userId']);
+            } else {
+                $this->assertArrayNotHasKey('userId', $event);
+            }
+        }
+        $this->assertSame([
+            'ambient_track',
+            'ambient_error',
+            'ambient_page',
+            'revenue_transaction',
+            'blank_track',
+            'blank_error',
+            'blank_page',
+            'revenue_transaction',
+        ], array_column($scoped, 'event'));
+    }
+
     public function testGlobalPropertiesMergeOverrideAndRemove(): void
     {
         $this->startClient();

@@ -8,6 +8,7 @@ use Alitycs\AnalyticsEvent;
 use Alitycs\BatchPayload;
 use Alitycs\EventContext;
 use Alitycs\EventType;
+use Alitycs\FileBatchStore;
 use Alitycs\HttpTransport;
 use PHPUnit\Framework\TestCase;
 
@@ -113,13 +114,22 @@ final class HttpTransportTest extends TestCase
         $this->assertSame([1000], $this->sleeps);
     }
 
-    public function testHugeRetryAfterIsStillCappedAtTenSeconds(): void
+    public function testHugeRetryAfterUsesTheSeparateServerDelayCap(): void
     {
         $transport = $this->transport(maxRetries: 1, statusPlan: '429,202', retryAfterPlan: '3600');
 
         $this->assertTrue($transport->send($this->payload()));
 
-        $this->assertSame([10_000], $this->sleeps);
+        $this->assertSame([60_000], $this->sleeps);
+    }
+
+    public function testFarFutureRetryAfterHttpDateUsesTheServerDelayCap(): void
+    {
+        $transport = $this->transport();
+        $parse = new \ReflectionMethod(HttpTransport::class, 'parseRetryAfterMs');
+        $future = gmdate('D, d M Y H:i:s \G\M\T', time() + 3600);
+
+        $this->assertSame(60_000, $parse->invoke($transport, ['retry-after' => [$future]]));
     }
 
     public function testClientErrorsAreNotRetried(): void
@@ -180,13 +190,152 @@ final class HttpTransportTest extends TestCase
         $this->assertSame(1, preg_match('//u', $event['event']), 'delivered event must be valid UTF-8');
     }
 
+    public function testPersistedBatchIsReplayedExactlyAfterRestart(): void
+    {
+        $path = sys_get_temp_dir() . '/alitycs-php-wal-' . bin2hex(random_bytes(6)) . '.json';
+        try {
+            $first = $this->transport(maxRetries: 0, statusPlan: '500,202', persistencePath: $path);
+            $this->assertFalse($first->send($this->payload()));
+            $this->assertTrue($first->durableEnabled());
+            $this->assertSame(1, $first->pendingDurableEvents());
+
+            $restarted = $this->transport(maxRetries: 0, persistencePath: $path);
+            $this->assertTrue($restarted->recover());
+            $this->assertSame(0, $restarted->pendingDurableEvents());
+            $requests = $this->server->requests();
+            $this->assertSame($requests[0]['body'], $requests[1]['body']);
+            $this->assertFileDoesNotExist($path);
+        } finally {
+            @unlink($path);
+        }
+    }
+
+    public function testPersistStoresWithoutNetworkThenRecoveryDelivers(): void
+    {
+        $path = sys_get_temp_dir() . '/alitycs-php-wal-' . bin2hex(random_bytes(6)) . '.json';
+        try {
+            $transport = $this->transport(maxRetries: 0, persistencePath: $path);
+            $payload = $this->payload();
+
+            $this->assertTrue($transport->persist($payload));
+            $this->assertSame(1, $transport->pendingDurableEvents());
+            $this->assertSame([], $this->server->requests(), 'persist must not touch the network');
+
+            $this->assertTrue($transport->recover());
+            $this->assertSame(0, $transport->pendingDurableEvents());
+            $this->assertSame($payload->batchId, $this->server->requests()[0]['body']['batchId']);
+        } finally {
+            @unlink($path);
+        }
+    }
+
+    public function testPersistFailureReturnsFalseWithoutNetwork(): void
+    {
+        $parentFile = (string) tempnam(sys_get_temp_dir(), 'alitycs-php-parent-file-');
+        try {
+            $transport = $this->transport(
+                maxRetries: 0,
+                persistencePath: $parentFile . '/wal.json',
+            );
+
+            $this->assertFalse($transport->persist($this->payload()));
+            $this->assertSame([], $this->server->requests());
+        } finally {
+            @unlink($parentFile);
+        }
+    }
+
+    public function testRestartDefersPersistedRetryAfterWithoutSleeping(): void
+    {
+        $path = sys_get_temp_dir() . '/alitycs-php-wal-' . bin2hex(random_bytes(6)) . '.json';
+        try {
+            $first = $this->transport(
+                maxRetries: 0,
+                statusPlan: '429,202',
+                retryAfterPlan: '3',
+                persistencePath: $path,
+            );
+            $this->assertFalse($first->send($this->payload()));
+            $this->sleeps = [];
+
+            $restarted = $this->transport(maxRetries: 0, persistencePath: $path);
+            $this->assertFalse($restarted->recover());
+            $this->assertSame([], $this->sleeps);
+            $this->assertSame(1, $restarted->pendingDurableEvents());
+            $this->assertCount(1, $this->server->requests(), 'recovery must not overtake the pause');
+        } finally {
+            @unlink($path);
+        }
+    }
+
+    public function testFailedRecoveryKeepsTheDurableBatchPending(): void
+    {
+        $path = sys_get_temp_dir() . '/alitycs-php-wal-' . bin2hex(random_bytes(6)) . '.json';
+        try {
+            $first = $this->transport(maxRetries: 0, statusPlan: '500', persistencePath: $path);
+            $this->assertFalse($first->send($this->payload()));
+
+            $restarted = $this->transport(maxRetries: 0, persistencePath: $path);
+            $this->assertFalse($restarted->recover());
+            $this->assertSame(1, $restarted->pendingDurableEvents());
+        } finally {
+            @unlink($path);
+        }
+    }
+
+    public function testTerminalRecoveryAcknowledgesAndContinues(): void
+    {
+        $path = sys_get_temp_dir() . '/alitycs-php-wal-' . bin2hex(random_bytes(6)) . '.json';
+        try {
+            $store = new FileBatchStore($path);
+            $store->put('batch_rejected', '{"batchId":"batch_rejected"}', 1);
+            $store->put('batch_healthy', '{"batchId":"batch_healthy"}', 1);
+            $restarted = $this->transport(maxRetries: 0, statusPlan: '400,202', persistencePath: $path);
+
+            $this->assertTrue($restarted->recover());
+            $this->assertSame(0, $restarted->pendingDurableEvents());
+            $this->assertCount(2, $this->server->requests());
+        } finally {
+            @unlink($path);
+        }
+    }
+
+    public function testRecoveryContainsAcknowledgeFailureAndRetainsTheWal(): void
+    {
+        $path = sys_get_temp_dir() . '/alitycs-php-wal-' . bin2hex(random_bytes(6)) . '.json';
+        $blockingDirectory = sys_get_temp_dir() . '/alitycs-php-block-' . bin2hex(random_bytes(6));
+        mkdir($blockingDirectory, 0700);
+        file_put_contents($blockingDirectory . '/marker', 'keep non-empty');
+        try {
+            $store = new FileBatchStore($path);
+            $store->put('batch_first', '{"batchId":"batch_first"}', 1);
+            $store->put('batch_second', '{"batchId":"batch_second"}', 1);
+            $transport = $this->transport(maxRetries: 0, persistencePath: $path);
+            $transportStore = (new \ReflectionProperty(HttpTransport::class, 'store'))->getValue($transport);
+            self::assertInstanceOf(FileBatchStore::class, $transportStore);
+            (new \ReflectionProperty(FileBatchStore::class, 'path'))->setValue(
+                $transportStore,
+                $blockingDirectory,
+            );
+
+            $this->assertFalse($transport->recover());
+            $this->assertSame(2, $transport->pendingDurableEvents());
+            $this->assertCount(1, $this->server->requests());
+        } finally {
+            @unlink($path);
+            @unlink($blockingDirectory . '/marker');
+            @rmdir($blockingDirectory);
+        }
+    }
+
     // ---------------------------------------------------------------------- helpers
 
     private function transport(
         int $maxRetries = 3,
         bool $debug = false,
         string $statusPlan = '',
-        string $retryAfterPlan = ''
+        string $retryAfterPlan = '',
+        ?string $persistencePath = null,
     ): HttpTransport {
         if ($this->server === null) {
             $this->server = LocalIngestServer::start($statusPlan, $retryAfterPlan);
@@ -198,7 +347,8 @@ final class HttpTransportTest extends TestCase
             $maxRetries,
             5000,
             $debug,
-            fn (int $ms) => $this->sleeps[] = $ms
+            fn (int $ms) => $this->sleeps[] = $ms,
+            $persistencePath,
         );
     }
 

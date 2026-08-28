@@ -8,6 +8,7 @@ use Alitycs\AnalyticsEvent;
 use Alitycs\BatchManager;
 use Alitycs\BatchPayload;
 use Alitycs\Config;
+use Alitycs\DeliveryResult;
 use Alitycs\EventContext;
 use PHPUnit\Framework\TestCase;
 
@@ -205,6 +206,43 @@ final class BatchManagerTest extends TestCase
         $this->assertSame(1, $manager->lostTotal());
     }
 
+    public function testAuthenticationRejectionIsNotSplit(): void
+    {
+        $manager = $this->makeManagerWithSend(
+            new Config('k', ['flushSize' => 25, 'flushInterval' => 0]),
+            function (BatchPayload $payload): DeliveryResult {
+                $this->sent[] = $payload;
+
+                return DeliveryResult::rejected(401);
+            },
+        );
+        foreach (range(1, 10) as $index) {
+            $manager->add($this->event("auth-$index"));
+        }
+        $manager->flush();
+
+        $this->assertCount(1, $this->sent, 'an auth failure must not amplify into per-event requests');
+        $this->assertSame(10, $manager->lostTotal());
+    }
+
+    public function testBatchRejectionSplitIsBoundedToSixtyFourSends(): void
+    {
+        $manager = $this->makeManagerWithSend(
+            new Config('k', ['flushSize' => 100, 'flushInterval' => 0, 'maxQueueSize' => 100]),
+            function (BatchPayload $payload): DeliveryResult {
+                $this->sent[] = $payload;
+
+                return DeliveryResult::rejected(400);
+            },
+        );
+        foreach (range(1, 100) as $index) {
+            $manager->add($this->event("split-$index"));
+        }
+
+        $this->assertCount(64, $this->sent);
+        $this->assertSame(100, $manager->lostTotal());
+    }
+
     public function testRefusedDeliveriesAreCountedLostInsteadOfAccumulating(): void
     {
         // With maxQueueSize >= flushSize enforced, the queue cannot silently fill up:
@@ -225,6 +263,212 @@ final class BatchManagerTest extends TestCase
         $this->assertSame(0, $manager->deliveredTotal());
     }
 
+    public function testDurableTransientFailureLeavesOwnershipWithTheWal(): void
+    {
+        $manager = new BatchManager(
+            new Config('k', ['flushSize' => 25, 'flushInterval' => 0]),
+            static fn (): DeliveryResult => DeliveryResult::transient(503),
+            clock: fn (): float => $this->now,
+            recover: static fn (): bool => true,
+            durablePending: static fn (): int => 1,
+            durable: true,
+        );
+        $manager->add($this->event('durable'));
+        $manager->flush();
+
+        $this->assertSame(1, $manager->pending());
+        $this->assertSame(0, $manager->lostTotal());
+    }
+
+    public function testSplitExceptionRetainsOnlyTheUnresolvedBranch(): void
+    {
+        $attempted = [];
+        $failSecond = true;
+        $manager = new BatchManager(
+            new Config('k', ['flushSize' => 25, 'flushInterval' => 0]),
+            function (BatchPayload $payload) use (&$attempted, &$failSecond): DeliveryResult {
+                $names = $this->eventNames($payload);
+                $attempted[] = $names;
+                if (count($names) > 1) {
+                    return DeliveryResult::rejected(400);
+                }
+                if ($names[0] === 'b' && $failSecond) {
+                    throw new \RuntimeException('persistence unavailable');
+                }
+
+                return DeliveryResult::accepted(202);
+            },
+            clock: fn (): float => $this->now,
+            recover: static fn (): bool => true,
+            durablePending: static fn (): int => 0,
+            durable: true,
+        );
+        foreach (['a', 'b', 'c', 'd'] as $name) {
+            $manager->add($this->event($name));
+        }
+
+        $manager->flush();
+
+        $this->assertSame(1, $manager->pending(), 'only the throwing branch stays in memory');
+        $this->assertSame(3, $manager->deliveredTotal());
+        $this->assertSame(0, $manager->lostTotal());
+
+        $failSecond = false;
+        $manager->flush();
+
+        $this->assertSame(0, $manager->pending());
+        $this->assertSame(4, $manager->deliveredTotal());
+        $this->assertSame([['a'], ['b'], ['c'], ['d'], ['b']], array_values(array_filter(
+            $attempted,
+            static fn (array $names): bool => count($names) === 1,
+        )));
+    }
+
+    public function testTransientFailureWithoutPersistenceIsCountedLost(): void
+    {
+        $manager = new BatchManager(
+            new Config('k', ['flushSize' => 25, 'flushInterval' => 0]),
+            static fn (): DeliveryResult => DeliveryResult::transient(503),
+            fn (): float => $this->now,
+        );
+        $manager->add($this->event('transient'));
+        $manager->flush();
+
+        $this->assertSame(0, $manager->pending());
+        $this->assertSame(1, $manager->lostTotal());
+    }
+
+    public function testRecoveryExceptionLeavesMemoryQueueUntouched(): void
+    {
+        $manager = new BatchManager(
+            new Config('k', ['flushSize' => 25, 'flushInterval' => 0]),
+            static fn (): bool => true,
+            clock: fn (): float => $this->now,
+            recover: static function (): bool {
+                throw new \RuntimeException('bad WAL');
+            },
+        );
+        $manager->add($this->event('waiting'));
+        $manager->flush();
+
+        $this->assertSame(1, $manager->pending());
+    }
+
+    public function testShutdownPersistsQueuedEventsInFifoOrderWhenRecoveryIsBlocked(): void
+    {
+        $durablePending = 1;
+        $persisted = [];
+        $manager = new BatchManager(
+            new Config('k', ['flushSize' => 2, 'flushInterval' => 0, 'maxQueueSize' => 5]),
+            static fn (): DeliveryResult => DeliveryResult::accepted(202),
+            clock: fn (): float => $this->now,
+            recover: static fn (): bool => false,
+            durablePending: static function () use (&$durablePending): int {
+                return $durablePending;
+            },
+            durable: true,
+            persist: function (BatchPayload $payload) use (&$persisted, &$durablePending): bool {
+                $persisted[] = $payload;
+                $durablePending += count($payload->events);
+
+                return true;
+            },
+        );
+        foreach (['a', 'b', 'c'] as $name) {
+            $manager->add($this->event($name));
+        }
+
+        $manager->shutdown();
+
+        $this->assertSame([['a'], ['b'], ['c']], array_map($this->eventNames(...), $persisted));
+        $this->assertSame(4, $manager->pending());
+        $this->assertSame(0, $manager->lostTotal());
+    }
+
+    public function testShutdownCountsQueuedEventsLostWhenFallbackPersistenceFails(): void
+    {
+        $manager = new BatchManager(
+            new Config('k', ['flushSize' => 2, 'flushInterval' => 0]),
+            static fn (): DeliveryResult => DeliveryResult::accepted(202),
+            clock: fn (): float => $this->now,
+            recover: static fn (): bool => false,
+            durablePending: static fn (): int => 1,
+            durable: true,
+            persist: static fn (): bool => false,
+        );
+        $manager->add($this->event('lost-at-shutdown'));
+
+        $manager->shutdown();
+
+        $this->assertSame(1, $manager->pending(), 'only the older durable record remains');
+        $this->assertSame(1, $manager->lostTotal());
+    }
+
+    public function testShutdownPersistsWhatFitsBeforeCountingTheRemainderLost(): void
+    {
+        $durablePending = 1;
+        $persisted = [];
+        $manager = new BatchManager(
+            new Config('k', ['flushSize' => 3, 'flushInterval' => 0]),
+            static fn (): DeliveryResult => DeliveryResult::accepted(202),
+            clock: fn (): float => $this->now,
+            recover: static fn (): bool => false,
+            durablePending: static function () use (&$durablePending): int {
+                return $durablePending;
+            },
+            durable: true,
+            persist: function (BatchPayload $payload) use (&$persisted, &$durablePending): bool {
+                if ($persisted !== []) {
+                    return false;
+                }
+                $persisted[] = $payload;
+                $durablePending++;
+
+                return true;
+            },
+        );
+        foreach (['saved', 'lost-1', 'lost-2'] as $name) {
+            $manager->add($this->event($name));
+        }
+
+        $manager->shutdown();
+
+        $this->assertSame(['saved'], $this->eventNames($persisted[0]));
+        $this->assertSame(2, $manager->pending());
+        $this->assertSame(2, $manager->lostTotal());
+    }
+
+    public function testShutdownPersistsAQueuedBranchAfterDispatchThrows(): void
+    {
+        $durablePending = 0;
+        $persisted = [];
+        $manager = new BatchManager(
+            new Config('k', ['flushSize' => 25, 'flushInterval' => 0]),
+            static function (): DeliveryResult {
+                throw new \RuntimeException('persistence unavailable');
+            },
+            clock: fn (): float => $this->now,
+            recover: static fn (): bool => true,
+            durablePending: static function () use (&$durablePending): int {
+                return $durablePending;
+            },
+            durable: true,
+            persist: function (BatchPayload $payload) use (&$durablePending, &$persisted): bool {
+                $persisted[] = $payload;
+                $durablePending += count($payload->events);
+
+                return true;
+            },
+        );
+        $manager->add($this->event('shutdown-remainder'));
+
+        $manager->shutdown();
+
+        $this->assertSame(['shutdown-remainder'], $this->eventNames($persisted[0]));
+        $this->assertSame(1, $manager->pending());
+        $this->assertSame(0, $manager->lostTotal());
+    }
+
     // ------------------------------------------------------------------ fork safety
 
     public function testResetForChildHandsInheritedEventsBackToTheParent(): void
@@ -241,6 +485,25 @@ final class BatchManagerTest extends TestCase
             $manager->lostTotal(),
             'ownership moved back to the parent — nothing was lost'
         );
+    }
+
+    public function testResetForChildDisablesInheritedDurabilityForLossAccounting(): void
+    {
+        $manager = new BatchManager(
+            new Config('k', ['flushSize' => 25, 'flushInterval' => 0]),
+            static fn (): DeliveryResult => DeliveryResult::transient(503),
+            clock: fn (): float => $this->now,
+            recover: static fn (): bool => true,
+            durablePending: static fn (): int => 0,
+            durable: true,
+        );
+
+        $manager->resetForChild();
+        $manager->add($this->event('child-transient'));
+        $manager->flush();
+
+        $this->assertSame(0, $manager->pending());
+        $this->assertSame(1, $manager->lostTotal());
     }
 
     // ---------------------------------------------------------------------- helpers

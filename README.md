@@ -42,10 +42,11 @@ are delivered by exactly three triggers:
 3. **Script shutdown** — via `register_shutdown_function()`, so a request that ends
    without an explicit flush still delivers.
 
-`shutdown()` drains fully and never loses queued events; it is safe to call more than
-once. After it returns, every enqueued event has been sent or permanently dropped under
-the retry policy below. Events enqueued after `shutdown()` are ignored (logged in debug
-mode), because there is nothing left to deliver them.
+`shutdown()` resolves ownership without silently losing queued events; it is safe to call
+more than once. After it returns, every enqueued event has been sent, durably retained, or
+permanently dropped and counted under the retry policy below. Events enqueued after
+`shutdown()` are ignored (logged in debug mode), because there is nothing left to deliver
+them.
 
 `flushInterval` exists for API parity but is **opportunistic**: it is never a timer. It
 is checked only while events keep arriving — each enqueue compares elapsed wall time
@@ -73,9 +74,22 @@ $app->middleware(function ($request, $next) use ($alitycs) {
 });
 ```
 
+When logical requests can overlap on one client, pass a named per-call `userId` instead
+of mutating shared identity. The override is captured only for that event:
+
+```php
+$alitycs->track('checkout_started', userId: $request->userId);
+$alitycs->captureError('checkout_failed', ['code' => 'E_CARD'], userId: $request->userId);
+```
+
+The same optional argument is available on `trackRevenue()` and `page()`.
+Omitting it uses the ambient identity from `identify()`; passing a blank string explicitly
+suppresses that ambient identity for the individual event.
+
 Queued but unsent events are **not** dropped by `resetForRequest()`; flush beforehand if
 they should be delivered before the identities change. For Swoole coroutine workers,
-create one client per worker process and reset per coroutine request as above.
+prefer per-call `userId` values; resetting shared ambient state while requests overlap is
+not safe.
 
 ## Configuration
 
@@ -90,6 +104,7 @@ create one client per worker process and reset per coroutine request as above.
 | `sessionTimeout` | `1800000` | Inactivity (ms) before the session id rotates |
 | `debug` | `false` | Log diagnostics to stderr under `[Alitycs]` |
 | `batching` | `true` | When `false`, every event is its own single-event batch |
+| `persistencePath` | `null` | Optional exact in-flight batch WAL path for restart recovery |
 
 Unknown option names throw — a typo fails loudly instead of running on defaults.
 
@@ -97,8 +112,16 @@ Unknown option names throw — a typo fails loudly instead of running on default
 
 Batches are retried with exponential backoff (1s, 2s, 4s … capped at 10s) on `5xx`,
 `429`, and network errors, up to `maxRetries` times. Any other `4xx` is permanent and is
-never retried. Delivery failures are logged, never thrown — a dead endpoint cannot fatal
-your application, at the cost of dropping the batch once retries are exhausted.
+never retried. A server `Retry-After` value replaces the generated delay and uses a separate 60s
+safety bound rather than the 10s client-backoff cap. Delivery failures are logged, never thrown —
+a dead endpoint cannot fatal your application. Without persistence, an exhausted transient batch
+is lost. With `persistencePath`, the exact serialized batch is atomically retained. A later
+`flush()`/`shutdown()` replays it byte-identically after any remaining `Retry-After` pause has
+elapsed; it returns promptly while a pause is still active. Terminal responses acknowledge and
+remove the record. The WAL also accepts queued events during a blocked shutdown and is capped at
+`maxQueueSize` retained events. Configure one process owner per path. After a fork, the child
+detaches from the inherited parent WAL; create a fresh client with a child-specific
+`persistencePath` when child delivery must also be durable.
 
 ## Revenue
 
