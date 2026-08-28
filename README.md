@@ -42,8 +42,8 @@ are delivered by exactly three triggers:
 3. **Script shutdown** — via `register_shutdown_function()`, so a request that ends
    without an explicit flush still delivers.
 
-`shutdown()` drains fully and never silently loses queued events; it is safe to call more
-than once. After it returns, every enqueued event has been sent, durably retained, or
+`shutdown()` resolves ownership without silently losing queued events; it is safe to call
+more than once. After it returns, every enqueued event has been sent, durably retained, or
 permanently dropped and counted under the retry policy below. Events enqueued after
 `shutdown()` are ignored (logged in debug mode), because there is nothing left to deliver
 them.
