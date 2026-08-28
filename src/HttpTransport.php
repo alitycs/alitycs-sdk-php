@@ -14,12 +14,15 @@ namespace Alitycs;
  * responses — the ingest endpoint has no redirects, and retrying one only burns the
  * retry budget on the same answer. `send()` never throws — a batch that exhausts its
  * retries is dropped and logged, so a failing endpoint can never fatal the host
- * application.
+ * application. When persistence is configured, a retry-exhausted transient batch stays
+ * in an exact-body write-ahead log for replay by the next client process.
  */
 final class HttpTransport
 {
     private const BACKOFF_BASE_MS = 1000;
     private const BACKOFF_CAP_MS = 10_000;
+
+    private readonly FileBatchStore $store;
 
     /**
      * @param int $maxRetries attempts after the first one
@@ -31,8 +34,10 @@ final class HttpTransport
         private readonly int $maxRetries = 3,
         private readonly int $timeoutMs = 10_000,
         private readonly bool $debug = false,
-        private readonly ?\Closure $sleepMs = null
+        private readonly ?\Closure $sleepMs = null,
+        ?string $persistencePath = null,
     ) {
+        $this->store = new FileBatchStore($persistencePath);
     }
 
     /** @return bool true when the batch was accepted (2xx). */
@@ -50,8 +55,65 @@ final class HttpTransport
             return false;
         }
 
+        $this->store->put($payload->batchId, $body, count($payload->events));
+
+        return $this->sendRecord($payload->batchId, $body)->isAccepted();
+    }
+
+    /** Outcome-preserving form used by the batch manager. */
+    public function sendWithOutcome(BatchPayload $payload): DeliveryResult
+    {
+        $body = json_encode(
+            $payload,
+            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | \JSON_INVALID_UTF8_SUBSTITUTE
+        );
+        if ($body === false) {
+            Log::warn('Batch failed to encode as JSON — dropped: ' . json_last_error_msg());
+
+            return DeliveryResult::rejected(0);
+        }
+
+        $this->store->put($payload->batchId, $body, count($payload->events));
+
+        return $this->sendRecord($payload->batchId, $body);
+    }
+
+    /** Replays every persisted batch body without regenerating any identity fields. */
+    public function recover(): bool
+    {
+        foreach ($this->store->snapshot() as $record) {
+            $pausedUntilMs = $record['pausedUntilMs'];
+            if ($pausedUntilMs !== null) {
+                $remainingMs = max(0, $pausedUntilMs - self::nowMs());
+                if ($remainingMs > 0) {
+                    $this->sleep($remainingMs);
+                }
+            }
+
+            if (!$this->sendRecord($record['batchId'], $record['body'])->isAccepted()) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    public function pendingDurableEvents(): int
+    {
+        return $this->store->pendingEvents();
+    }
+
+    public function durableEnabled(): bool
+    {
+        return $this->store->enabled();
+    }
+
+    private function sendRecord(string $batchId, string $body): DeliveryResult
+    {
+
         $lastError = 'unknown error';
         $retryAfterMs = null;
+        $retryAfterUntilMs = null;
 
         for ($attempt = 0; $attempt <= $this->maxRetries; $attempt++) {
             if ($attempt > 0) {
@@ -70,20 +132,27 @@ final class HttpTransport
             if ($error !== null) {
                 $lastError = $error;
             } elseif ($status >= 200 && $status < 300) {
-                return true;
+                $this->store->acknowledge($batchId);
+
+                return DeliveryResult::accepted($status);
             } elseif ($status >= 300 && $status < 400) {
                 // Terminal: redirects are never followed (CURLOPT_FOLLOWLOCATION is off)
                 // and re-posting the batch to a 3xx answer cannot change that answer.
                 Log::warn("Transport: HTTP $status — redirect responses are terminal, not retrying");
 
-                return false;
+                $this->store->acknowledge($batchId);
+
+                return DeliveryResult::rejected($status);
             } elseif ($status >= 400 && $status < 500 && $status !== 429) {
                 Log::warn("Transport: HTTP $status — batch rejected, not retrying");
 
-                return false;
+                $this->store->acknowledge($batchId);
+
+                return DeliveryResult::rejected($status);
             } else {
                 if ($status === 429) {
                     $retryAfterMs = $this->parseRetryAfterMs($headers);
+                    $retryAfterUntilMs = $retryAfterMs === null ? null : self::nowMs() + $retryAfterMs;
                 }
                 $lastError = "HTTP $status";
             }
@@ -93,9 +162,13 @@ final class HttpTransport
             }
         }
 
-        Log::warn("Transport: all retries exhausted — batch not delivered: $lastError");
+        $this->store->pause($batchId, $retryAfterUntilMs);
+        Log::warn("Transport: all retries exhausted — batch retained for restart: $lastError");
 
-        return false;
+        return DeliveryResult::transient(
+            str_starts_with($lastError, 'HTTP ') ? (int) substr($lastError, 5) : null,
+            $retryAfterUntilMs,
+        );
     }
 
     /**
@@ -180,5 +253,10 @@ final class HttpTransport
         }
 
         usleep($milliseconds * 1000);
+    }
+
+    private static function nowMs(): int
+    {
+        return (int) floor(microtime(true) * 1000);
     }
 }

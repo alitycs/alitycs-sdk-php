@@ -9,7 +9,7 @@ namespace Alitycs;
  * request. There is deliberately no timer — see {@see Config::$flushInterval} for the
  * opportunistic elapsed-time check that stands in for one.
  *
- * Delivery is honest: the boolean returned by the send closure is used. A refused
+ * Delivery is honest: the outcome returned by the send closure is used. A refused
  * payload is split in half and each half retried recursively (the server rejects whole
  * batches when one event violates a limit); an individual event the server still
  * refuses is dropped loudly — warn-level log plus {@see lostTotal()} — because
@@ -30,13 +30,18 @@ final class BatchManager
     private int $lostTotal = 0;
 
     /**
-     * @param (\Closure(BatchPayload): bool) $send delivery callback: true = accepted
+     * @param (\Closure(BatchPayload): (bool|DeliveryResult)) $send delivery callback
      * @param (\Closure(): float)|null $clock seconds-since-epoch; injectable for tests
+     * @param (\Closure(): bool)|null $recover replays durable batches before new work
+     * @param (\Closure(): int)|null $durablePending persisted event count
      */
     public function __construct(
         private readonly Config $config,
         private readonly \Closure $send,
-        private readonly ?\Closure $clock = null
+        private readonly ?\Closure $clock = null,
+        private readonly ?\Closure $recover = null,
+        private readonly ?\Closure $durablePending = null,
+        private readonly bool $durable = false,
     ) {
         $this->lastFlushAttemptAt = $this->now();
     }
@@ -69,9 +74,19 @@ final class BatchManager
         }
     }
 
-    /** Sends everything currently queued; a no-op on an empty queue. Never throws. */
+    /** Replays durable work, then sends everything currently queued. Never throws. */
     public function flush(): void
     {
+        try {
+            if ($this->recover !== null && ($this->recover)() !== true) {
+                return;
+            }
+        } catch (\Throwable $throwable) {
+            Log::warn('Durable batch recovery failed: ' . $throwable->getMessage());
+
+            return;
+        }
+
         if ($this->queue === []) {
             return;
         }
@@ -84,8 +99,13 @@ final class BatchManager
         try {
             $this->deliver($events, 0);
         } catch (\Throwable $throwable) {
-            $this->lostTotal += count($events);
-            Log::warn('Batch dispatch failed — events dropped: ' . $throwable->getMessage());
+            if ($this->durable) {
+                $this->queue = array_merge($events, $this->queue);
+                Log::warn('Batch dispatch failed — events retained in memory: ' . $throwable->getMessage());
+            } else {
+                $this->lostTotal += count($events);
+                Log::warn('Batch dispatch failed — events dropped: ' . $throwable->getMessage());
+            }
         }
     }
 
@@ -120,7 +140,9 @@ final class BatchManager
 
     public function pending(): int
     {
-        return count($this->queue);
+        $durablePending = $this->durablePending === null ? 0 : ($this->durablePending)();
+
+        return count($this->queue) + $durablePending;
     }
 
     /**
@@ -134,23 +156,18 @@ final class BatchManager
     {
         $payload = new BatchPayload('batch_' . Utils::generateId(), Utils::nowMs(), $events);
 
-        try {
-            $accepted = ($this->send)($payload);
-        } catch (\Throwable $throwable) {
-            Log::warn(
-                'Transport failure (' . $throwable->getMessage() . ') — '
-                . count($events) . ' event(s) not delivered'
-            );
-            $accepted = false;
-        }
+        $rawOutcome = ($this->send)($payload);
+        $outcome = $rawOutcome instanceof DeliveryResult
+            ? $rawOutcome
+            : ($rawOutcome === true ? DeliveryResult::accepted(200) : DeliveryResult::rejected(400));
 
-        if ($accepted === true) {
+        if ($outcome->isAccepted()) {
             $this->deliveredTotal += count($events);
 
             return;
         }
 
-        if (count($events) > 1 && $depth < self::MAX_SPLIT_DEPTH) {
+        if ($outcome->isRejected() && count($events) > 1 && $depth < self::MAX_SPLIT_DEPTH) {
             $mid = intdiv(count($events), 2);
             $this->deliver(array_slice($events, 0, $mid), $depth + 1);
             $this->deliver(array_slice($events, $mid), $depth + 1);
@@ -158,11 +175,24 @@ final class BatchManager
             return;
         }
 
+        if ($outcome->isRejected()) {
+            $this->lostTotal += count($events);
+            Log::warn(
+                'Server refused ' . count($events) . ' event(s)'
+                . ' — dropped, not retried (re-queueing would poison future batches)'
+            );
+
+            return;
+        }
+
+        if ($this->durable) {
+            Log::warn('Transient delivery failure — exact batch retained for restart');
+
+            return;
+        }
+
         $this->lostTotal += count($events);
-        Log::warn(
-            'Server refused ' . count($events) . ' event(s)'
-            . ' — dropped, not retried (re-queueing would poison future batches)'
-        );
+        Log::warn('Transient delivery failure without persistence — ' . count($events) . ' event(s) lost');
     }
 
     private function now(): float

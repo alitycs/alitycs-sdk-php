@@ -73,9 +73,20 @@ $app->middleware(function ($request, $next) use ($alitycs) {
 });
 ```
 
+When logical requests can overlap on one client, pass a named per-call `userId` instead
+of mutating shared identity. The override is captured only for that event:
+
+```php
+$alitycs->track('checkout_started', userId: $request->userId);
+$alitycs->captureError('checkout_failed', ['code' => 'E_CARD'], userId: $request->userId);
+```
+
+The same optional argument is available on `trackRevenue()` and `page()`.
+
 Queued but unsent events are **not** dropped by `resetForRequest()`; flush beforehand if
 they should be delivered before the identities change. For Swoole coroutine workers,
-create one client per worker process and reset per coroutine request as above.
+prefer per-call `userId` values; resetting shared ambient state while requests overlap is
+not safe.
 
 ## Configuration
 
@@ -90,6 +101,7 @@ create one client per worker process and reset per coroutine request as above.
 | `sessionTimeout` | `1800000` | Inactivity (ms) before the session id rotates |
 | `debug` | `false` | Log diagnostics to stderr under `[Alitycs]` |
 | `batching` | `true` | When `false`, every event is its own single-event batch |
+| `persistencePath` | `null` | Optional exact in-flight batch WAL path for restart recovery |
 
 Unknown option names throw — a typo fails loudly instead of running on defaults.
 
@@ -98,7 +110,11 @@ Unknown option names throw — a typo fails loudly instead of running on default
 Batches are retried with exponential backoff (1s, 2s, 4s … capped at 10s) on `5xx`,
 `429`, and network errors, up to `maxRetries` times. Any other `4xx` is permanent and is
 never retried. Delivery failures are logged, never thrown — a dead endpoint cannot fatal
-your application, at the cost of dropping the batch once retries are exhausted.
+your application. Without persistence, an exhausted transient batch is lost. With
+`persistencePath`, the exact serialized batch is atomically retained and the next process replays
+it on `flush()`/`shutdown()`, including any remaining `Retry-After` pause. Terminal responses
+acknowledge and remove it. The WAL covers batches that reached transport, not events still waiting
+in the PHP queue; configure one process owner per path.
 
 ## Revenue
 

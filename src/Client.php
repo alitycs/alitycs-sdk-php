@@ -72,10 +72,17 @@ final class Client
             maxRetries: $this->config->maxRetries,
             timeoutMs: $this->config->timeoutMs,
             debug: $this->config->debug,
+            persistencePath: $this->config->persistencePath,
         );
         $this->sessionManager = new SessionManager($this->config->sessionTimeout);
         $this->batchManager = $this->config->batching
-            ? new BatchManager($this->config, $this->transport->send(...))
+            ? new BatchManager(
+                config: $this->config,
+                send: $this->transport->sendWithOutcome(...),
+                recover: $this->transport->recover(...),
+                durablePending: $this->transport->pendingDurableEvents(...),
+                durable: $this->transport->durableEnabled(),
+            )
             : null;
 
         self::$liveClients ??= new \WeakMap();
@@ -169,13 +176,13 @@ final class Client
     }
 
     /** @param array<string, mixed> $properties */
-    public function track(string $eventName, array $properties = []): void
+    public function track(string $eventName, array $properties = [], ?string $userId = null): void
     {
         if ($eventName === '') {
             return;
         }
 
-        $this->enqueue(EventType::Track, $eventName, $properties);
+        $this->enqueue(EventType::Track, $eventName, $properties, userId: $userId);
     }
 
     /**
@@ -183,19 +190,23 @@ final class Client
      *
      * @param array<string, mixed> $properties
      */
-    public function trackRevenue(RevenuePayload $payload, array $properties = []): void
+    public function trackRevenue(
+        RevenuePayload $payload,
+        array $properties = [],
+        ?string $userId = null,
+    ): void
     {
-        $this->enqueue(EventType::Track, 'revenue_' . $payload->kind, $properties, $payload);
+        $this->enqueue(EventType::Track, 'revenue_' . $payload->kind, $properties, $payload, $userId);
     }
 
     /** @param array<string, mixed> $properties */
-    public function captureError(string $errorName, array $properties = []): void
+    public function captureError(string $errorName, array $properties = [], ?string $userId = null): void
     {
         if ($errorName === '') {
             return;
         }
 
-        $this->enqueue(EventType::Error, $errorName, $properties);
+        $this->enqueue(EventType::Error, $errorName, $properties, userId: $userId);
     }
 
     /**
@@ -217,11 +228,11 @@ final class Client
     }
 
     /** Emits a page view; servers pass the page name explicitly. */
-    public function page(?string $name = null, array $properties = []): void
+    public function page(?string $name = null, array $properties = [], ?string $userId = null): void
     {
         $pageName = $name === null || $name === '' ? 'page_view' : $name;
 
-        $this->enqueue(EventType::Page, $pageName, $properties);
+        $this->enqueue(EventType::Page, $pageName, $properties, userId: $userId);
     }
 
     /** Rotates session and anonymous ids and clears the identified user. */
@@ -290,7 +301,11 @@ final class Client
             return;
         }
 
-        $this->batchManager?->flush();
+        if ($this->batchManager !== null) {
+            $this->batchManager->flush();
+        } else {
+            $this->transport->recover();
+        }
     }
 
     /**
@@ -312,9 +327,12 @@ final class Client
             unset(self::$liveClients[$this]);
         }
 
-        // Drain rather than flush-once so nothing can remain queued afterwards.
-        while ($this->batchManager !== null && $this->batchManager->pending() > 0) {
+        // One attempt drains the in-memory queue. Durable transient batches remain on
+        // disk for a later process instead of making shutdown loop forever.
+        if ($this->batchManager !== null) {
             $this->batchManager->flush();
+        } else {
+            $this->transport->recover();
         }
     }
 
@@ -323,7 +341,7 @@ final class Client
     {
         $this->adoptCurrentProcess();
 
-        return $this->batchManager?->pending() ?? 0;
+        return $this->batchManager?->pending() ?? $this->transport->pendingDurableEvents();
     }
 
     /**
@@ -342,7 +360,13 @@ final class Client
     }
 
     /** @param array<string, mixed>|null $properties */
-    private function enqueue(EventType $type, string $name, ?array $properties, ?RevenuePayload $revenue = null): void
+    private function enqueue(
+        EventType $type,
+        string $name,
+        ?array $properties,
+        ?RevenuePayload $revenue = null,
+        ?string $userId = null,
+    ): void
     {
         $this->adoptCurrentProcess();
 
@@ -354,6 +378,12 @@ final class Client
 
         $this->sessionManager->touch();
         $session = $this->sessionManager->getSession();
+
+        // Capture a provided identity for this event without mutating ambient client
+        // state. Shared long-lived server clients can therefore interleave requests.
+        $effectiveUserId = $userId !== null
+            ? (trim($userId) === '' ? null : $userId)
+            : $this->userId;
 
         try {
             $event = new AnalyticsEvent(
@@ -367,7 +397,7 @@ final class Client
                     array_merge($this->globalProperties, $properties ?? [])
                 ),
                 context: Context::collect(self::SDK_VERSION),
-                userId: $this->userId,
+                userId: $effectiveUserId,
                 revenue: $revenue,
             );
             Utils::validateEvent($event);

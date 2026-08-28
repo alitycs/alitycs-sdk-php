@@ -99,6 +99,52 @@ final class ClientIntegrationTest extends TestCase
         $this->assertArrayNotHasKey('userId', $afterTrack);
     }
 
+    public function testSharedClientKeepsInterleavedPerCallUsersIsolated(): void
+    {
+        $this->startClient(['flushSize' => 100]);
+
+        for ($index = 0; $index < 25; $index++) {
+            $this->client->track("request_a_$index", userId: 'usr_request_a');
+            $this->client->track("request_b_$index", userId: 'usr_request_b');
+        }
+        $this->client->flush();
+
+        $events = $this->server->requests()[0]['body']['events'];
+        $this->assertCount(50, $events);
+        foreach ($events as $event) {
+            $expected = str_starts_with($event['event'], 'request_a_')
+                ? 'usr_request_a'
+                : 'usr_request_b';
+            $this->assertSame($expected, $event['userId'], $event['event']);
+        }
+    }
+
+    public function testPerCallUserAppliesToEveryEventApi(): void
+    {
+        $this->startClient(['flushSize' => 10]);
+
+        $this->client->track('scoped_track', userId: 'usr_track');
+        $this->client->captureError('scoped_error', userId: 'usr_error');
+        $this->client->page('scoped_page', userId: 'usr_page');
+        $this->client->trackRevenue(
+            RevenuePayload::transaction('scoped_fact', '5.00', 'USD'),
+            userId: 'usr_revenue',
+        );
+        $this->client->flush();
+
+        $events = $this->server->requests()[0]['body']['events'];
+        $usersByEvent = [];
+        foreach ($events as $event) {
+            $usersByEvent[$event['event']] = $event['userId'];
+        }
+        $this->assertSame([
+            'scoped_track' => 'usr_track',
+            'scoped_error' => 'usr_error',
+            'scoped_page' => 'usr_page',
+            'revenue_transaction' => 'usr_revenue',
+        ], $usersByEvent);
+    }
+
     public function testGlobalPropertiesMergeOverrideAndRemove(): void
     {
         $this->startClient();

@@ -8,6 +8,7 @@ use Alitycs\AnalyticsEvent;
 use Alitycs\BatchManager;
 use Alitycs\BatchPayload;
 use Alitycs\Config;
+use Alitycs\DeliveryResult;
 use Alitycs\EventContext;
 use PHPUnit\Framework\TestCase;
 
@@ -223,6 +224,53 @@ final class BatchManagerTest extends TestCase
         $this->assertSame(0, $manager->pending(), 'nothing accumulates past a refused send');
         $this->assertSame(4, $manager->lostTotal());
         $this->assertSame(0, $manager->deliveredTotal());
+    }
+
+    public function testDurableTransientFailureLeavesOwnershipWithTheWal(): void
+    {
+        $manager = new BatchManager(
+            new Config('k', ['flushSize' => 25, 'flushInterval' => 0]),
+            static fn (): DeliveryResult => DeliveryResult::transient(503),
+            clock: fn (): float => $this->now,
+            recover: static fn (): bool => true,
+            durablePending: static fn (): int => 1,
+            durable: true,
+        );
+        $manager->add($this->event('durable'));
+        $manager->flush();
+
+        $this->assertSame(1, $manager->pending());
+        $this->assertSame(0, $manager->lostTotal());
+    }
+
+    public function testTransientFailureWithoutPersistenceIsCountedLost(): void
+    {
+        $manager = new BatchManager(
+            new Config('k', ['flushSize' => 25, 'flushInterval' => 0]),
+            static fn (): DeliveryResult => DeliveryResult::transient(503),
+            fn (): float => $this->now,
+        );
+        $manager->add($this->event('transient'));
+        $manager->flush();
+
+        $this->assertSame(0, $manager->pending());
+        $this->assertSame(1, $manager->lostTotal());
+    }
+
+    public function testRecoveryExceptionLeavesMemoryQueueUntouched(): void
+    {
+        $manager = new BatchManager(
+            new Config('k', ['flushSize' => 25, 'flushInterval' => 0]),
+            static fn (): bool => true,
+            clock: fn (): float => $this->now,
+            recover: static function (): bool {
+                throw new \RuntimeException('bad WAL');
+            },
+        );
+        $manager->add($this->event('waiting'));
+        $manager->flush();
+
+        $this->assertSame(1, $manager->pending());
     }
 
     // ------------------------------------------------------------------ fork safety

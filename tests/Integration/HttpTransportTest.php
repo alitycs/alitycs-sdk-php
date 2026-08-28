@@ -180,13 +180,71 @@ final class HttpTransportTest extends TestCase
         $this->assertSame(1, preg_match('//u', $event['event']), 'delivered event must be valid UTF-8');
     }
 
+    public function testPersistedBatchIsReplayedExactlyAfterRestart(): void
+    {
+        $path = sys_get_temp_dir() . '/alitycs-php-wal-' . bin2hex(random_bytes(6)) . '.json';
+        try {
+            $first = $this->transport(maxRetries: 0, statusPlan: '500,202', persistencePath: $path);
+            $this->assertFalse($first->send($this->payload()));
+            $this->assertTrue($first->durableEnabled());
+            $this->assertSame(1, $first->pendingDurableEvents());
+
+            $restarted = $this->transport(maxRetries: 0, persistencePath: $path);
+            $this->assertTrue($restarted->recover());
+            $this->assertSame(0, $restarted->pendingDurableEvents());
+            $requests = $this->server->requests();
+            $this->assertSame($requests[0]['body'], $requests[1]['body']);
+            $this->assertFileDoesNotExist($path);
+        } finally {
+            @unlink($path);
+        }
+    }
+
+    public function testRestartHonoursPersistedRetryAfterDeadline(): void
+    {
+        $path = sys_get_temp_dir() . '/alitycs-php-wal-' . bin2hex(random_bytes(6)) . '.json';
+        try {
+            $first = $this->transport(
+                maxRetries: 0,
+                statusPlan: '429,202',
+                retryAfterPlan: '3',
+                persistencePath: $path,
+            );
+            $this->assertFalse($first->send($this->payload()));
+            $this->sleeps = [];
+
+            $restarted = $this->transport(maxRetries: 0, persistencePath: $path);
+            $this->assertTrue($restarted->recover());
+            $this->assertNotEmpty($this->sleeps);
+            $this->assertGreaterThanOrEqual(2500, $this->sleeps[0]);
+        } finally {
+            @unlink($path);
+        }
+    }
+
+    public function testFailedRecoveryKeepsTheDurableBatchPending(): void
+    {
+        $path = sys_get_temp_dir() . '/alitycs-php-wal-' . bin2hex(random_bytes(6)) . '.json';
+        try {
+            $first = $this->transport(maxRetries: 0, statusPlan: '500', persistencePath: $path);
+            $this->assertFalse($first->send($this->payload()));
+
+            $restarted = $this->transport(maxRetries: 0, persistencePath: $path);
+            $this->assertFalse($restarted->recover());
+            $this->assertSame(1, $restarted->pendingDurableEvents());
+        } finally {
+            @unlink($path);
+        }
+    }
+
     // ---------------------------------------------------------------------- helpers
 
     private function transport(
         int $maxRetries = 3,
         bool $debug = false,
         string $statusPlan = '',
-        string $retryAfterPlan = ''
+        string $retryAfterPlan = '',
+        ?string $persistencePath = null,
     ): HttpTransport {
         if ($this->server === null) {
             $this->server = LocalIngestServer::start($statusPlan, $retryAfterPlan);
@@ -198,7 +256,8 @@ final class HttpTransportTest extends TestCase
             $maxRetries,
             5000,
             $debug,
-            fn (int $ms) => $this->sleeps[] = $ms
+            fn (int $ms) => $this->sleeps[] = $ms,
+            $persistencePath,
         );
     }
 
