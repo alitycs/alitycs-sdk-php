@@ -30,7 +30,7 @@ namespace Alitycs;
  */
 final class Client
 {
-    public const SDK_VERSION = '1.0.0';
+    public const SDK_VERSION = '1.0.1';
 
     private readonly Config $config;
     private readonly HttpTransport $transport;
