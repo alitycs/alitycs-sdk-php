@@ -5,6 +5,12 @@ here before a version tag is created.
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-08-30
+
+### Fixed
+- The release workflow now reads `Client::SDK_VERSION` with a valid PHP namespace separator,
+  allowing the immutable-tag gate to complete before artifact creation and attestation.
+
 ## [1.0.0] - 2026-08-28
 
 ### Added
@@ -71,5 +77,6 @@ here before a version tag is created.
 - Only HTTP 400 whole-batch rejections are split. Authentication, authorization, redirect, and
   other permanent failures are dropped once, and split isolation is capped at 64 sends.
 
-[Unreleased]: https://github.com/alitycs/alitycs-sdk-php/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/alitycs/alitycs-sdk-php/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/alitycs/alitycs-sdk-php/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/alitycs/alitycs-sdk-php/releases/tag/v1.0.0

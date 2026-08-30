@@ -36,7 +36,7 @@ jobs:
           tag_commit="$(git rev-parse "${GITHUB_REF}^{commit}")"
           [[ "$tag_commit" == "$GITHUB_SHA" ]]
           git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main
-          version="$(php -r 'require "src/Client.php"; echo Alitycs\\Client::SDK_VERSION;')"
+          version="$(php -r 'require "src/Client.php"; echo Alitycs\Client::SDK_VERSION;')"
           [[ "$GITHUB_REF_NAME" == "v${version}" ]]
           printf 'tag_commit=%s\ntag_object=%s\n' "$tag_commit" "$tag_object" >> "$GITHUB_OUTPUT"
       - name: Set up PHP
